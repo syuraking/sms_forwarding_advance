@@ -1709,7 +1709,7 @@ jsQR 1.4.0 — https://github.com/cozmo/jsQR — Apache License 2.0
   }
   /* 版本检查走浏览器：设备不联网，接口换地址也不会再受堆内存限制。
      GitHub 的 release 资产地址没有 CORS 头，只能走 api.github.com。 */
-  var OTA_API = 'https://api.github.com/repos/chenxuuu/sms_forwarding/releases/latest';
+  var OTA_API = 'https://api.github.com/repos/syuraking/sms_forwarding_advance/releases/latest';
   var OTA_TTL = 12 * 3600 * 1000;   /* 12 小时内不重复请求，避开 API 限流 */
   function otaRemoteRead(){
     try { return JSON.parse(LS.getItem('otaRemote') || 'null'); } catch(e){ return null; }
