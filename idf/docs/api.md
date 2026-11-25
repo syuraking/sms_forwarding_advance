@@ -14,15 +14,9 @@
 | `/modem?action=restart\|hardreset`、`/wifi?action=restart`、`/system?action=restart` | 先回包，后台任务执行动作 |
 | `/`、`/log`、`/save` | 同步，但不碰 AT，毫秒级完成 |
 
-异步任务栈默认 6KB，走 TLS 的（`/push_test`、`/mail_test`、`/selftest`、`/keepalive_http`）8KB，
-`/sendsms` 10KB。任务创建失败时直接回 `503` + `{"success":false,"message":"设备内存紧张，请稍后重试"}`，
-不会让请求悬着。任务结束时若栈余量低于 512 字节，日志会记一条告警。
-
 需要注意：**AT 串口仍然是独占资源**（模组作业队列深度 4）。例如一次 35 秒的 `/ping`
 或最长 45 秒的 `/keepalive_http` 会让之后提交的 AT 作业排队，若排队等待超时则返回"超时或无响应"；
 HTTP 服务本身不受影响，页面还能正常打开和刷新。
-
-查询串按实际长度解析（上限 4KB），`/decode?pdu=…` 这类长参数不会被截断。
 
 ## 页面
 
@@ -31,7 +25,7 @@ HTTP 服务本身不受影响，页面还能正常打开和刷新。
 | GET | `/`、`/tools`、`/sms` | 管理界面（单页，标签页切换） |
 | GET | `/favicon.ico` | 空响应，避免日志噪声 |
 
-单页内含 8 个标签页：概览、推送通道、设备、固件升级、保号发送（发短信 + Ping + HTTP 访问）、
+单页内含 7 个标签页：概览、推送通道、设备、保号发送（发短信 + Ping + HTTP 访问）、
 后台管理、日志（含 AT 指令）、关于项目。关于页为纯前端页面，
 展示项目开源地址（https://github.com/chenxuuu/sms_forwarding）、固件版本、设备型号与设备名，
 不新增后端接口。
@@ -53,16 +47,14 @@ HTTP 服务本身不受影响，页面还能正常打开和刷新。
 | `operatorMode` | 选网模式：0=自动（默认）/ 1=手动 |
 | `operatorCode` | 手动模式的 PLMN，5~6 位数字（如 46000） |
 | `operatorAct` | 手动模式网络类型：0=2G(GSM) / 2=3G(UTRAN) / 7=LTE（默认） |
-| `pushNen` / `pushNtype` / `pushNname` / `pushNurl` / `pushNkey1` / `pushNkey2` / `pushNbody` | 第 N 个推送通道（N=0..49，实际数量由 `pushCount` 决定） |
+| `pushNen` / `pushNtype` / `pushNname` / `pushNurl` / `pushNkey1` / `pushNkey2` / `pushNbody` | 第 N 个推送通道（N=0..4） |
 
 返回 3 秒后跳回首页的提示页。手动选网若 PLMN 非 5~6 位数字、或网络类型非法，
 接口直接返回 JSON 错误且不落盘。保存选网配置后需重启设备，在模组初始化时通过 `AT+COPS` 生效。
 
 ### GET /status
 
-前端轮询用的轻量状态（不碰 AT，毫秒级）：`ip/ssid/rssi/heap_kb/uptime_s/modem_ready/email_ok/mail_enabled/self_phone/push_count/device_name/model`，
-外加固件相关的 `version`（当前版本，`YYYYMMDD.HHMM`）、`ota_state`（0 空闲/1 接收中/2 校验中/3 等待重启/4 失败）。
-有没有新版本由浏览器比对（见「固件升级」），设备端不再保存远端版本。
+前端轮询用的轻量状态（不碰 AT，毫秒级）：`ip/ssid/rssi/heap_kb/uptime_s/modem_ready/email_ok/mail_enabled/self_phone/push_count/device_name/model`。
 `mail_enabled` 是邮件通道开关；`email_ok` 表示「开关打开且 SMTP 四项配置齐全」（即 config_mail_active），
 关闭后即便 SMTP 填好也不再发邮件。
 
@@ -73,21 +65,10 @@ HTTP 服务本身不受影响，页面还能正常打开和刷新。
 
 ### GET /config
 
-返回完整配置快照（含当前全部推送通道），前端据此渲染表单，避免服务端拼 HTML。
+返回完整配置快照（含 5 个推送通道），前端据此渲染表单，避免服务端拼 HTML。
 另含本机号码 `self_phone`（`AT+CNUM` 自动获取或后台手填，可能为空）、
 邮件开关 `mail_enabled`（布尔，缺省视为开启），以及选网字段 `operator_mode`（0 自动/1 手动）、`operator_code`（PLMN）、`operator_act`（0=2G/2=3G/7=LTE）。
 密码等敏感字段也在其中，接口本身受 Basic 认证保护。
-
-通道对象字段固定为 `enabled` / `type` / `name` / `url` / `key1` / `key2` / **`custom_body`**：
-
-```json
-{"channels":[{"enabled":true,"type":10,"name":"Telegram","url":"https://api.telegram.org",
-  "key1":"<chat_id>","key2":"<bot_token>","custom_body":""}]}
-```
-
-> 注意：**提交**用的表单字段叫 `pushNbody`，**读回**用的 JSON 键叫 `custom_body`（与结构体
-> `push_channel_t.custom_body` 一致）。两边名字不一致曾经导致自定义模板保存后读回为空
-> （issue #77），改代码时别再把它们当成同一个名字。
 
 ### POST /save?json=1
 
@@ -133,7 +114,7 @@ HTTP 服务本身不受影响，页面还能正常打开和刷新。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/log` | 最近 200 行日志（JSON 字符串数组），单行超过 192 字节会从 UTF-8 字符边界截断；含 `AT> 命令 → 应答 [结果]` 格式的原始 AT 交互，前端可按「AT指令」过滤 |
+| GET | `/log` | 最近 200 行日志（JSON 字符串数组）；含 `AT> 命令 → 应答 [结果]` 格式的原始 AT 交互，前端可按「AT指令」过滤 |
 | GET | `/decode?pdu=<hex>` | 解析一条 SMS-DELIVER PDU，返回发送者/时间/文本/长短信信息 |
 | GET | `/selftest?url=<https地址>` | HTTPS 连通性自检（CA bundle / TLS / DNS），默认测试 baidu |
 | POST | `/push_test` | 用请求里的通道参数发一条测试消息，用于验证新通道是否可用 |
@@ -185,7 +166,7 @@ cfun=1 全功能、cfun=4 飞行模式（射频关闭）。
 
 模板与载荷里的本机号码：自定义模板（type=7）支持 `{sender}` `{message}` `{timestamp}` `{self_phone}`；
 POST JSON 载荷多一个 `self_phone` 字段，GET 多一个 `self_phone` 查询参数，
-Bark 的 body 与钉钉/飞书/PushPlus/Server酱/Gotify/Telegram 的正文末尾会自动追加「本机号码: …」（未配置时省略）。
+Bark 的 body 与钉钉/飞书/PushPlus/Server酱/Gotify/Telegram/WxPusher 的正文末尾会自动追加「本机号码: …」（未配置时省略）。
 
 ### POST /push_test
 
@@ -194,7 +175,7 @@ Bark 的 body 与钉钉/飞书/PushPlus/Server酱/Gotify/Telegram 的正文末�
 
 | 字段 | 说明 |
 |---|---|
-| `type` | 推送类型 1..10 |
+| `type` | 推送类型 1..11 |
 | `name` | 通道名称，仅用于日志和返回文案 |
 | `url` / `key1` / `key2` / `body` | 该类型对应的 URL、密钥与自定义模板 |
 
@@ -206,109 +187,6 @@ Bark 的 body 与钉钉/飞书/PushPlus/Server酱/Gotify/Telegram 的正文末�
 用请求体里的 SMTP 参数直接发一封测试邮件，同样不需要先保存（字段名与 /save 一致：
 `smtpServer` / `smtpPort` / `smtpUser` / `smtpPass` / `smtpTo`），端口缺省按 465（SSL）处理。
 四项任一为空返回「邮件配置不完整」；发送失败时日志里能看到具体阶段（连接 / 认证 / DATA / 服务端拒收）。
-
-## 固件升级
-
-### GET /ota
-
-返回升级状态，前端进入「固件升级」页时拉一次：
-
-```json
-{"success":true,"current":"20261123.1033","target":"","state":0,"progress":0,"message":""}
-```
-
-- `current`：当前运行版本，浏览器用它和 GitHub 上的最新版本比较
-- `target`：已写入、等待重启后生效的版本
-- `state` / `progress` / `message`：升级进度与最近一次结果（失败原因给页面直接显示）
-
-远端版本信息**不在设备端**：页面直接请求
-`https://api.github.com/repos/chenxuuu/sms_forwarding/releases/latest`，读 `name`（Release 标题就是版本号）
-和 `assets` 里的下载地址，结果缓存在浏览器 `localStorage`（12 小时）。
-
-### POST /ota
-
-上传固件。**必须**带 `Content-Length`，请求体是 `sms_forwarder-ota.bin` 的原始字节，
-`Content-Type` 建议 `application/octet-stream`（不接受 multipart 表单）。
-
-| 情况 | 响应 |
-|---|---|
-| 成功 | 200 `{"success":true,"version":"20261124.1200","message":"固件已写入，设备即将重启"}`，约 2 秒后重启 |
-| 缺 Content-Length | 411 |
-| 超过分区容量 | 413，且不会擦写 flash |
-| 不是 app 镜像（如 merged 包） | 400 `这不是可用的 ota 固件…`，当前固件不受影响 |
-| 传输中断 / 校验失败 | 400，另一个分区仍保留原固件 |
-| 正在升级 | 409 |
-
-写入的是非活动分区，失败不影响当前固件；写完后 `esp_ota_set_boot_partition` 并等待重启。
-
-### 版本检查（不在设备端）
-
-设备**不联网检查版本**，也没有 `/ota_check` 接口（旧固件有，现已删除，请求返回 404）。
-后台页面一打开就 fetch GitHub API（不等用户点「立即检查」），用 `name` 和 `GET /ota` 的 `current` 比新旧：
-
-- 有新版本：显示最新版本、下载链接、侧边栏红点
-- 12 小时内不重复请求（避开 GitHub API 的 60 次/小时/IP 限流）
-- 请求失败（离线、被墙、限流）只在页面提示，不影响上传升级
-
-好处是设备端省掉一次 TLS 握手：`ota` 组件的 8 KB 工作任务和 HTTP 客户端都已删除，
-实测空闲堆从 24 KB 回到 40 KB。
-
-## eSIM 管理
-
-支持**读列表、切换、删除未启用的配置**。没有 eUICC 复位（`purge`）接口——那会清空整张卡。
-下载安装新配置不在设备上跑，步骤见 [esim-import.md](esim-import.md)。
-
-### GET /esim
-
-异步读取（要发 3–4 条 APDU，约 1–3 秒）：
-
-```json
-{"success":true,"supported":true,"eid":"89049032123456789012345678901234","busy":false,
- "profiles":[{"iccid":"89860012345678901234","aid":"A0000005591010FFFFFFFF8900001000",
-  "name":"中国移动 主卡","provider":"CMCC","state":1,"class":2}],"message":""}
-```
-
-- `supported`：模组是否支持 `AT+CCHO`/`AT+CGLA`（不支持时 `profiles` 为空、`message` 给原因）
-- `state`：1 使用中 / 0 未启用 / -1 未知；`class`：0 测试 / 1 预置 / 2 运营 / -1 未知
-- `name`：优先用卡里的 profileName，其次昵称，最后运营商名或 ICCID
-
-### POST /esim
-
-表单 `id=<ICCID 或 32 位 AID>`，启用指定配置（eUICC 会自动停用当前生效的那条）：
-
-```json
-{"success":true,"message":"已切换，模组正在重新注册网络（约 20 秒）"}
-```
-
-成功后固件会在 2 秒后软重启模组（`AT+CFUN=1,1`）。失败时 `message` 是 eUICC 结果码的中文解释
-（找不到 / 状态不对 / 策略禁止 / CAT busy 等）；返回 5（CAT busy）会自动改用「不刷新」重试一次。
-
-表单再加 `action=delete` 时删除指定配置（`id` 同上）：
-
-```json
-{"success":true,"message":"已删除该配置"}
-```
-
-- **正在使用中的配置会被拒绝**（`「xxx」正在使用中，不能删除；请先切换到其它配置`），
-  避免删掉唯一能用的卡。删除前固件会先读一次列表做这个检查。
-- 删除只发 `BF33`，不重启模组；返回码 1 表示找不到该 ICCID / AID。
-
-### POST /esim/apdu
-
-给 PC 上的 `tools/esim_bridge.py` 用的原始 APDU 透传，表单：
-
-| 字段 | 说明 |
-|---|---|
-| `func` | `connect` / `logic_channel_open` / `logic_channel_close` / `transmit` / `disconnect` |
-| `param` | `logic_channel_open` 传 AID 十六进制；`logic_channel_close` 传通道号（十六进制）；`transmit` 传整条 APDU |
-
-```json
-{"success":true,"ecode":1}
-{"success":true,"ecode":0,"data":"BF3E...9000"}
-```
-
-`transmit` 使用最近一次打开的通道；单条 APDU 最长 255 字节（RSP 的分段由 lpac 负责）。
-
 
 ## 定时任务
 

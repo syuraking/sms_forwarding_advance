@@ -54,22 +54,53 @@ static volatile bool s_init_done;
 static char s_model[MODEM_MODEL_MAX];
 static char s_version[MODEM_VERSION_MAX];
 
-/* ---- URC：短信上报 ---- */
-#define PDU_WAIT_MAX_LINES 16
-#define PDU_WAIT_MAX_MS 5000
+/* ---- URC：来电显示 ---- */
+#define CALL_DEDUP_MS 20000 /* 同一号码在此时间内的重复振铃视为同一通来电 */
+static modem_call_cb_t s_call_cb;
+static char s_last_call[32];
+static int64_t s_last_call_ms = -1;
 
-static bool s_expect_pdu;
-static volatile bool s_sms_cfg_dirty = true; /* 需要复核 +CNMI（SIM 重新初始化后会丢） */
-static int s_pdu_wait_lines;  /* +CMT 之后夹进来的非 PDU 行数 */
-static int64_t s_pdu_wait_ms; /* 开始等 PDU 的时刻 */
-static int s_last_urc_stat = -1;
-
-/** PDU 是纯十六进制、够长；用来和夹在中间的 AT 应答区分开 */
-static bool looks_like_pdu(const char *line)
+void modem_set_call_handler(modem_call_cb_t cb)
 {
-    size_t n = strlen(line);
-    return n >= 20 && (n % 2) == 0 && util_is_hex_string(line);
+    s_call_cb = cb;
 }
+
+/** 解析 +CLIP: "<number>",<type>,... 里的号码（可能为空串）。 */
+static void handle_clip(const char *line)
+{
+    char number[sizeof(s_last_call)] = {0};
+    const char *q1 = strchr(line, '"');
+    if (q1) {
+        const char *q2 = strchr(q1 + 1, '"');
+        if (q2) {
+            size_t n = (size_t)(q2 - (q1 + 1));
+            if (n >= sizeof(number)) {
+                n = sizeof(number) - 1;
+            }
+            memcpy(number, q1 + 1, n);
+            number[n] = '\0';
+        }
+    }
+
+    /* 来电期间模组每次振铃（约 3~5 秒）都会重复上报 +CLIP，只在新来电时通知一次 */
+    int64_t now = esp_timer_get_time() / 1000;
+    bool same = s_last_call_ms >= 0 && (now - s_last_call_ms) < CALL_DEDUP_MS &&
+                strcmp(number, s_last_call) == 0;
+    s_last_call_ms = now;
+    snprintf(s_last_call, sizeof(s_last_call), "%s", number);
+    if (same) {
+        return;
+    }
+
+    log_line("收到来电: %s", number[0] ? number : "（号码未显示）");
+    if (s_call_cb) {
+        s_call_cb(number);
+    }
+}
+
+/* ---- URC：短信上报 ---- */
+static bool s_expect_pdu;
+static int s_last_urc_stat = -1; /* 上次记录的注册状态，避免周期性查询刷屏 */
 
 static void handle_urc(const char *line)
 {
@@ -77,8 +108,8 @@ static void handle_urc(const char *line)
         if (line[0] == '\0') {
             return; /* 空行忽略，继续等 PDU */
         }
-        if (looks_like_pdu(line)) {
-            s_expect_pdu = false;
+        s_expect_pdu = false;
+        if (util_is_hex_string(line)) {
             log_line("收到 PDU: %s", line);
             sms_deliver_t *msg = calloc(1, sizeof(*msg));
             if (!msg) {
@@ -95,40 +126,28 @@ static void handle_urc(const char *line)
             free(msg);
             return;
         }
-        /* 模组会先把 +CMT 报上来，再回当前 AT 命令的应答（+CPIN: READY 等），
-           PDU 夹在它后面。这里不能当成状态错位直接放弃，否则整条短信就丢了。 */
-        if (s_pdu_wait_lines == 0) {
-            s_pdu_wait_ms = esp_timer_get_time() / 1000;
-        }
-        s_pdu_wait_lines++;
-        if (s_pdu_wait_lines > PDU_WAIT_MAX_LINES ||
-            esp_timer_get_time() / 1000 - s_pdu_wait_ms > PDU_WAIT_MAX_MS) {
-            s_expect_pdu = false;
-            log_line("等待 PDU 超时（夹了 %d 行其它数据），该条短信已丢弃", s_pdu_wait_lines);
-        }
-        /* 这一行仍按普通 URC 继续解析（注册状态等） */
+        /* 状态错位（+CMT 与 PDU 之间夹了其它行）：复位后按普通 URC 继续解析 */
+        log_line("期望 PDU 却收到: %s", line);
     }
 
     if (util_starts_with(line, "+CMT:")) {
         s_expect_pdu = true;
-        s_pdu_wait_lines = 0;
-        s_pdu_wait_ms = 0;
         return;
+    }
+    if (util_starts_with(line, "+CLIP:")) {
+        handle_clip(line);
+        return;
+    }
+    if (util_starts_with(line, "NO CARRIER") || util_starts_with(line, "BUSY")) {
+        s_last_call_ms = -1; /* 通话结束：下一通来电（哪怕同号码）重新通知 */
     }
     if (util_starts_with(line, "+CMTI:")) {
         log_line("收到 +CMTI（短信存储通知）: %s", line);
         return;
     }
-    /* SIM 重新 READY（CFUN 循环、模组自重启）时，模组会把 +CNMI 恢复成默认的
-     * 0,0,0,0,0——短信从此不再上报，日志里连 +CMT 都没有。标记一下让守护任务复核。 */
-    if (util_starts_with(line, "+CPIN:")) {
-        if (strstr(line, "READY")) {
-            s_sms_cfg_dirty = true;
-        }
-        return;
-    }
     /* 网络守护每分钟轮询的应答：不逐条记录，只在注册状态真正变化时打一行 */
-    if (util_starts_with(line, "+CSQ:") || util_starts_with(line, "+CFUN:")) {
+    if (util_starts_with(line, "+CPIN:") || util_starts_with(line, "+CSQ:") ||
+        util_starts_with(line, "+CFUN:")) {
         return;
     }
     if (util_starts_with(line, "+CREG:") || util_starts_with(line, "+CEREG:") ||
@@ -356,67 +375,6 @@ static void detect_self_phone(void)
     }
 }
 
-/* ---- 短信直报（+CNMI / +CMGF） ---- */
-
-/* 读回 +CNMI，确认仍是「模式 2 + MT 直报(+CMT)」；0,0,0,0,0 就代表短信不再上报。 */
-static bool sms_config_intact(void)
-{
-    char resp[128] = {0};
-    if (at_command("AT+CNMI?", resp, sizeof(resp), 3000) != AT_RESULT_OK) {
-        return false;
-    }
-    const char *p = strstr(resp, "+CNMI:");
-    int mode = -1, mt = -1;
-    if (!p || sscanf(p, "+CNMI: %d,%d", &mode, &mt) != 2) {
-        return false;
-    }
-    return mode == 2 && mt == 2;
-}
-
-/** 下发短信直报配置（CNMI 直报 + PDU 模式）。 */
-static void apply_sms_config(void)
-{
-    while (!at_command_ok("AT+CNMI=2,2,0,0,0", 1000)) {
-        log_line("设置短信上报失败，重试...");
-        led_blink(300);
-    }
-    log_line("短信直报已开启（CNMI=2,2,0,0,0）");
-
-    while (!at_command_ok("AT+CMGF=0", 1000)) {
-        log_line("设置 PDU 模式失败，重试...");
-        led_blink(300);
-    }
-    log_line("PDU 模式已设置（CMGF=0）");
-    s_sms_cfg_dirty = false;
-}
-
-/**
- * 复核短信直报配置，被模组清掉就补上。
- *
- * 实测 ML307Y：AT+CFUN=1 之后约 8 秒（SIM 重新 +CPIN: READY 时）模组会把 +CNMI
- * 恢复成默认的 0,0,0,0,0，这条链路上从此不再报 +CMT——表现为「收不到短信，
- * 日志里一点动静都没有」。自愈流程在 CFUN=1 后 2 秒就补发 CNMI，正好被这次
- * 清零覆盖。所以除了 +CPIN READY 时打标记，还要定期读一次 +CNMI? 兜底。
- */
-void modem_sms_config_check(void)
-{
-    static int tick;
-    if (!s_init_done) {
-        return;
-    }
-    /* 打标记（SIM 重新就绪）时立刻查；平时每 10 轮（约 10 分钟）查一次 */
-    if (!s_sms_cfg_dirty && ++tick < 10) {
-        return;
-    }
-    tick = 0;
-    if (sms_config_intact()) {
-        s_sms_cfg_dirty = false;
-        return;
-    }
-    log_line("短信直报配置被模组复位（+CNMI 不是 2,2），重新开启");
-    apply_sms_config();
-}
-
 static void do_init(bool power_cycle)
 {
     s_ready = false;
@@ -468,7 +426,24 @@ static void do_init(bool power_cycle)
         log_line("ML307Y 跳过 AT+CGACT=0,1");
     }
 
-    apply_sms_config();
+    while (!at_command_ok("AT+CNMI=2,2,0,0,0", 1000)) {
+        log_line("设置短信上报失败，重试...");
+        led_blink(300);
+    }
+    log_line("短信直报已开启（CNMI=2,2,0,0,0）");
+
+    while (!at_command_ok("AT+CMGF=0", 1000)) {
+        log_line("设置 PDU 模式失败，重试...");
+        led_blink(300);
+    }
+    log_line("PDU 模式已设置（CMGF=0）");
+
+    /* 来电显示：开启后每次振铃会上报 +CLIP: "号码"。模组不支持语音时失败也不影响短信 */
+    if (at_command_ok("AT+CLIP=1", 2000)) {
+        log_line("来电显示已开启（CLIP=1）");
+    } else {
+        log_line("开启来电显示失败（AT+CLIP=1），来电通知不可用");
+    }
 
     /* 本机号码：用户未配置时尝试自动读取，失败就保持为空 */
     detect_self_phone();
@@ -491,9 +466,6 @@ static void do_init(bool power_cycle)
         led_set(true);
     }
     s_init_done = true;
-    /* 注册/附着过程中模组可能又把 +CNMI 清回默认值，这里强制复核一次 */
-    s_sms_cfg_dirty = true;
-    modem_sms_config_check();
 }
 
 /* 解析 +MPING: <result>,<ip>,<len>,<time>,<ttl> */

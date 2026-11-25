@@ -21,6 +21,7 @@
 #define FWD_TIME_MAX 32
 
 typedef struct {
+    bool is_call; /* true=来电提醒（sender 为来电号码，其余字段无效） */
     char sender[FWD_SENDER_MAX];
     char timestamp[FWD_TIME_MAX];
     char text[FWD_TEXT_MAX];
@@ -117,6 +118,16 @@ static void forwarder_task(void *arg)
         if (xQueueReceive(s_queue, ev, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        if (ev->is_call) {
+            log_line("处理来电: %s", ev->sender[0] ? ev->sender : "（号码未显示）");
+            if (ev->sender[0] && config_sender_blocked(ev->sender)) {
+                log_line("来电号码在黑名单中，忽略该来电");
+                continue;
+            }
+            notify_call(ev->sender);
+            continue;
+        }
+
         log_line("=== 处理短信 ===");
         log_line("发送者: %s", ev->sender);
         log_line("时间戳: %s", ev->timestamp);
@@ -157,6 +168,19 @@ static void on_sms_complete(const char *sender, const char *text, const char *ti
     }
 }
 
+static void on_call(const char *number)
+{
+    if (!s_queue) {
+        return;
+    }
+    sms_event_t ev = {0};
+    ev.is_call = true;
+    snprintf(ev.sender, sizeof(ev.sender), "%s", number ? number : "");
+    if (xQueueSend(s_queue, &ev, pdMS_TO_TICKS(200)) != pdTRUE) {
+        log_line("转发队列已满，丢弃来电提醒");
+    }
+}
+
 void forwarder_init(void)
 {
     s_queue = xQueueCreate(FWD_QUEUE_DEPTH, sizeof(sms_event_t));
@@ -166,6 +190,7 @@ void forwarder_init(void)
     }
     xTaskCreate(forwarder_task, "forwarder", 6144, NULL, 3, NULL);
     sms_assembler_init(on_sms_complete);
+    modem_set_call_handler(on_call);
     log_line("短信转发策略已就绪");
 }
 

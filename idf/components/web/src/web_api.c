@@ -8,7 +8,6 @@
 #include "core/log.h"
 #include "core/sbuf.h"
 #include "core/util.h"
-#include "esim/esim.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_system.h"
@@ -18,7 +17,6 @@
 #include "modem/pdu.h"
 #include "net/wifi.h"
 #include "notify/email.h"
-#include "ota/ota.h"
 #include "sched/sched.h"
 #include "notify/push.h"
 #include "web_internal.h"
@@ -205,8 +203,7 @@ esp_err_t handler_sendsms(httpd_req_t *req)
     char json_flag[8] = {0};
     bool want_json = web_query_get(req, "json", json_flag, sizeof(json_flag)) &&
                      strcmp(json_flag, "1") == 0;
-    /* 组 PDU + 走 AT 发短信，栈留宽一点 */
-    web_spawn_async3_ex(req, sendsms_async, phone, content, want_json ? "json" : "", 10240);
+    web_spawn_async3(req, sendsms_async, phone, content, want_json ? "json" : "");
     return ESP_OK;
 }
 
@@ -261,7 +258,7 @@ esp_err_t handler_keepalive_http(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"网址不能为空\"}");
         return ESP_OK;
     }
-    web_spawn_async3_ex(req, keepalive_http_async, url, "", "", 8192); /* 可能是 https，栈留够 TLS */
+    web_spawn_async(req, keepalive_http_async, url, "");
     return ESP_OK;
 }
 
@@ -981,7 +978,7 @@ esp_err_t handler_selftest(httpd_req_t *req)
     }
     char url[256] = {0};
     web_query_get(req, "url", url, sizeof(url));
-    web_spawn_async3_ex(req, selftest_async, url, "", "", 8192); /* 要跑 TLS 握手 */
+    web_spawn_async(req, selftest_async, url, "");
     return ESP_OK;
 }
 
@@ -996,7 +993,7 @@ static void push_test_async(web_async_ctx_t *ctx, sbuf_t *out, const char **ctyp
     char val[300] = {0};
     if (web_form_get(ctx->arg2, "type", val, sizeof(val))) {
         int t = atoi(val);
-        if (t < PUSH_TYPE_NONE || t > PUSH_TYPE_TELEGRAM) {
+        if (t < PUSH_TYPE_NONE || t > PUSH_TYPE_WXPUSHER) {
             t = PUSH_TYPE_POST_JSON;
         }
         ch.type = (uint8_t)t;
@@ -1050,9 +1047,12 @@ esp_err_t handler_push_test(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"通道参数过长\"}");
         return ESP_OK;
     }
-    /* 走 HTTPS 通道需要 TLS 握手，栈给 8 KB；任务起不来时 spawn 内部已经回过 503 JSON，不能再发第二遍 */
-    web_spawn_async3_ex(req, push_test_async, "", body, "", 8192);
+    esp_err_t err = web_spawn_async(req, push_test_async, "", body);
     free(body);
+    if (err != ESP_OK) {
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"设备忙，请稍后重试\"}");
+    }
     return ESP_OK;
 }
 
@@ -1109,8 +1109,12 @@ esp_err_t handler_mail_test(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "请求体为空");
         return ESP_OK;
     }
-    web_spawn_async3_ex(req, mail_test_async, "", body, "", 8192); /* 465 端口要跑 TLS 握手 */
+    esp_err_t err = web_spawn_async(req, mail_test_async, "", body);
     free(body);
+    if (err != ESP_OK) {
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"设备忙，请稍后重试\"}");
+    }
     return ESP_OK;
 }
 
@@ -1259,353 +1263,5 @@ esp_err_t handler_tasks(httpd_req_t *req)
     free(body);
     httpd_resp_send(req, sbuf_cstr(&out), out.len);
     sbuf_free(&out);
-    return ESP_OK;
-}
-
-/* ---- 固件升级：状态 / 上传 ---- */
-
-static void ota_to_json(sbuf_t *out)
-{
-    ota_info_t info;
-    ota_get_info(&info);
-
-    sbuf_append(out, "{\"success\":true,\"current\":\"");
-    util_json_escape(out, info.current);
-    sbuf_append(out, "\",\"target\":\"");
-    util_json_escape(out, info.next_version);
-    sbuf_printf(out, "\",\"state\":%d,\"progress\":%d,\"message\":\"", (int)info.state, info.progress);
-    util_json_escape(out, info.message);
-    sbuf_append(out, "\"}");
-}
-
-esp_err_t handler_ota(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    sbuf_t out;
-    sbuf_init(&out);
-    ota_to_json(&out);
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_send(req, sbuf_cstr(&out), out.len);
-    sbuf_free(&out);
-    return ESP_OK;
-}
-
-static void ota_error_json(httpd_req_t *req, const char *status, const char *message)
-{
-    sbuf_t out;
-    sbuf_init(&out);
-    json_fail(&out, "%s", message);
-    httpd_resp_set_status(req, status);
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, sbuf_cstr(&out), out.len);
-    sbuf_free(&out);
-}
-
-esp_err_t handler_ota_upload(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    if (ota_busy()) {
-        ota_error_json(req, "409 Conflict", "固件升级进行中，请等待本次结束");
-        return ESP_OK;
-    }
-
-    char len_hdr[16] = {0};
-    if (httpd_req_get_hdr_value_str(req, "Content-Length", len_hdr, sizeof(len_hdr)) != ESP_OK) {
-        ota_error_json(req, "411 Length Required", "缺少 Content-Length，请用上传按钮提交");
-        return ESP_OK;
-    }
-    long long total = atoll(len_hdr);
-    if (total <= 0 || total > 8 * 1024 * 1024) {
-        ota_error_json(req, "413 Payload Too Large", "固件大小异常");
-        return ESP_OK;
-    }
-
-    esp_err_t err = ota_begin((size_t)total);
-    if (err != ESP_OK) {
-        ota_info_t info;
-        ota_get_info(&info);
-        ota_error_json(req,
-                       err == ESP_ERR_INVALID_SIZE ? "413 Payload Too Large" : "400 Bad Request",
-                       info.message[0] ? info.message : "无法开始升级");
-        log_line("网页上传固件被拒绝：%s", info.message);
-        return ESP_OK;
-    }
-
-    uint8_t *buf = malloc(4096);
-    if (!buf) {
-        ota_abort();
-        ota_error_json(req, "500 Internal Server Error", "内存不足");
-        return ESP_OK;
-    }
-
-    int remaining = (int)total;
-    int timeouts = 0;
-    const char *fail_msg = NULL;
-    while (remaining > 0) {
-        int want = remaining > 4096 ? 4096 : remaining;
-        int r = httpd_req_recv(req, (char *)buf, want);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            if (++timeouts > 5) {
-                fail_msg = "接收超时，上传中断";
-                break;
-            }
-            continue;
-        }
-        if (r <= 0) {
-            fail_msg = "连接中断，上传未完成";
-            break;
-        }
-        if (ota_write(buf, (size_t)r) != ESP_OK) {
-            ota_info_t info;
-            ota_get_info(&info);
-            fail_msg = info.message[0] ? info.message : "写入失败";
-            break;
-        }
-        remaining -= r;
-    }
-    free(buf);
-
-    if (remaining > 0 || fail_msg) {
-        ota_abort();
-        if (!fail_msg) {
-            fail_msg = "上传未完成";
-        }
-        log_line("网页上传固件失败：%s", fail_msg);
-        ota_error_json(req, "400 Bad Request", fail_msg);
-        return ESP_OK;
-    }
-
-    err = ota_end();
-    if (err != ESP_OK) {
-        ota_info_t info;
-        ota_get_info(&info);
-        ota_error_json(req, "400 Bad Request", info.message[0] ? info.message : "固件校验失败");
-        return ESP_OK;
-    }
-
-    ota_info_t info;
-    ota_get_info(&info);
-    sbuf_t out;
-    sbuf_init(&out);
-    sbuf_append(&out, "{\"success\":true,\"version\":\"");
-    util_json_escape(&out, info.next_version);
-    sbuf_append(&out, "\",\"message\":\"固件已写入，设备即将重启\"}");
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_send(req, sbuf_cstr(&out), out.len);
-    sbuf_free(&out);
-    return ESP_OK;
-}
-
-/* ---- eSIM 管理 ---- */
-
-#define ESIM_APDU_HEX_MAX 520 /* 255 字节 APDU → 510 个十六进制字符 + NUL */
-
-static void esim_reset_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    log_line("eSIM 已切换，软重启模组以重新注册网络");
-    modem_soft_reset(90000);
-    vTaskDelete(NULL);
-}
-
-static void esim_json_fail(sbuf_t *out)
-{
-    sbuf_append(out, "{\"success\":false,\"message\":\"");
-    util_json_escape(out, esim_last_error());
-    sbuf_append(out, "\"}");
-}
-
-static void esim_async(web_async_ctx_t *ctx, sbuf_t *out, const char **content_type)
-{
-    (void)content_type;
-    if (strcmp(ctx->arg3, "delete") == 0) {
-        esim_err_t e = esim_delete_profile(ctx->arg1);
-        if (e != ESIM_OK) {
-            esim_json_fail(out);
-            log_line("eSIM 删除失败：%s", esim_last_error());
-            return;
-        }
-        sbuf_append(out, "{\"success\":true,\"message\":\"已删除该配置\"}");
-        return;
-    }
-    if (strcmp(ctx->arg3, "enable") == 0) {
-        int ecc = -1;
-        /* 先按「带刷新」切；有的模组会回 CAT busy（5），再按不带刷新重试 */
-        esim_err_t e = esim_enable_profile(ctx->arg1, true, &ecc);
-        if (e == ESIM_ERR_CARD && ecc == 5) {
-            log_line("eSIM 切换返回 CAT busy，改为不带刷新重试");
-            e = esim_enable_profile(ctx->arg1, false, &ecc);
-        }
-        if (e != ESIM_OK) {
-            esim_json_fail(out);
-            log_line("eSIM 切换失败：%s", esim_last_error());
-            return;
-        }
-        sbuf_append(out, "{\"success\":true,\"message\":\"已切换，模组正在重新注册网络（约 20 秒）\"}");
-        if (xTaskCreate(esim_reset_task, "esim_reset", 3072, NULL, 4, NULL) != pdPASS) {
-            log_line("eSIM 切换成功，但创建重启任务失败，请手动重启模组");
-        }
-        return;
-    }
-
-    char eid[40] = {0};
-    esim_profile_t *list = calloc(ESIM_MAX_PROFILES, sizeof(*list));
-    if (!list) {
-        sbuf_append(out, "{\"success\":false,\"message\":\"内存不足，请稍后重试\"}");
-        return;
-    }
-    int count = -1;
-    esim_err_t eid_err = esim_read_all(eid, sizeof(eid), list, ESIM_MAX_PROFILES, &count);
-
-    sbuf_printf(out, "{\"success\":true,\"supported\":%s,\"eid\":\"",
-                esim_supported() ? "true" : "false");
-    util_json_escape(out, eid);
-    sbuf_printf(out, "\",\"busy\":%s,\"profiles\":[", esim_busy() ? "true" : "false");
-    if (count > 0) {
-        for (int i = 0; i < count; i++) {
-            if (i) {
-                sbuf_append(out, ",");
-            }
-            sbuf_append(out, "{\"iccid\":\"");
-            util_json_escape(out, list[i].iccid);
-            sbuf_append(out, "\",\"aid\":\"");
-            util_json_escape(out, list[i].aid);
-            sbuf_append(out, "\",\"name\":\"");
-            util_json_escape(out, list[i].name);
-            sbuf_append(out, "\",\"provider\":\"");
-            util_json_escape(out, list[i].provider);
-            sbuf_printf(out, "\",\"state\":%d,\"class\":%d}", list[i].state, list[i].profile_class);
-        }
-    }
-    sbuf_append(out, "],\"message\":\"");
-    if (count < 0 || eid_err != ESIM_OK) {
-        util_json_escape(out, esim_last_error());
-    }
-    sbuf_append(out, "\"}");
-    free(list);
-}
-
-esp_err_t handler_esim(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    web_spawn_async3_ex(req, esim_async, "", "", "list", 4096);
-    return ESP_OK;
-}
-
-esp_err_t handler_esim_enable(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_read_body(req);
-    char id[48] = {0};
-    char action[16] = {0};
-    bool got = web_form_get(body, "id", id, sizeof(id));
-    web_form_get(body, "action", action, sizeof(action));
-    free(body);
-    const bool del = strcmp(action, "delete") == 0;
-    if (!got || !id[0]) {
-        web_send_json(req, false, del ? "缺少要删除的 ICCID / AID" : "缺少要切换的 ICCID / AID");
-        return ESP_OK;
-    }
-    if (esim_busy()) {
-        web_send_json(req, false, "eSIM 正忙，请稍后再试");
-        return ESP_OK;
-    }
-    web_spawn_async3_ex(req, esim_async, id, "", del ? "delete" : "enable", 4096);
-    return ESP_OK;
-}
-
-/**
- * 原始 APDU 透传：给 PC 上的 lpac 用（tools/esim_bridge.py）。
- * 表单：func=connect|logic_channel_open|logic_channel_close|transmit|disconnect
- *       param=<AID 十六进制 | 通道号十六进制 | APDU 十六进制>
- * 返回：{"success":true,"ecode":<通道号/0>,"data":"<应答十六进制>"}
- */
-esp_err_t handler_esim_apdu(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_read_body(req);
-    char func[32] = {0};
-    if (!body || !web_form_get(body, "func", func, sizeof(func))) {
-        free(body);
-        web_send_json(req, false, "缺少 func");
-        return ESP_OK;
-    }
-    char *param = calloc(1, 600);
-    if (!param) {
-        free(body);
-        web_send_json(req, false, "内存不足");
-        return ESP_OK;
-    }
-    web_form_get(body, "param", param, 600);
-    free(body);
-
-    sbuf_t out;
-    sbuf_init(&out);
-    int ecode = 0;
-    bool ok = true;
-    char *data = NULL;
-
-    if (strcmp(func, "connect") == 0 || strcmp(func, "disconnect") == 0) {
-        /* 连接/断开只做状态检查；真正的逻辑通道由 logic_channel_open 建立 */
-    } else if (strcmp(func, "logic_channel_open") == 0) {
-        int ch = 0;
-        if (esim_channel_open(param, &ch) == ESIM_OK) {
-            ecode = ch;
-        } else {
-            ok = false;
-        }
-    } else if (strcmp(func, "logic_channel_close") == 0) {
-        int ch = (int)strtol(param, NULL, 16);
-        if (ch > 0) {
-            esim_channel_close(ch);
-        } else {
-            ok = false;
-        }
-    } else if (strcmp(func, "transmit") == 0) {
-        int ch = esim_last_channel();
-        if (ch <= 0) {
-            ok = false;
-        } else {
-            data = calloc(1, ESIM_APDU_HEX_MAX);
-            if (!data || esim_transmit(ch, param, data, ESIM_APDU_HEX_MAX, NULL) != ESIM_OK) {
-                ok = false;
-            }
-        }
-    } else {
-        ok = false;
-    }
-
-    if (!ok) {
-        sbuf_append(&out, "{\"success\":false,\"message\":\"");
-        util_json_escape(&out, esim_last_error());
-        sbuf_append(&out, "\"}");
-    } else {
-        sbuf_printf(&out, "{\"success\":true,\"ecode\":%d", ecode);
-        if (data) {
-            sbuf_append(&out, ",\"data\":\"");
-            util_json_escape(&out, data);
-            sbuf_append(&out, "\"");
-        }
-        sbuf_append(&out, "}");
-    }
-
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-    httpd_resp_send(req, sbuf_cstr(&out), out.len);
-    sbuf_free(&out);
-    free(data);
-    free(param);
     return ESP_OK;
 }

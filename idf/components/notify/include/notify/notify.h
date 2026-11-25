@@ -16,6 +16,9 @@ void notify_init(void);
 /** 推送一条短信（邮件 + 所有已启用通道）。 */
 void notify_sms(const char *sender, const char *message, const char *timestamp);
 
+/** 推送一条来电提醒（邮件 + 所有已启用通道）。number 为空表示号码未显示。 */
+void notify_call(const char *number);
+
 /** 仅发送邮件（管理员命令结果等）。 */
 void notify_email(const char *subject, const char *body);
 

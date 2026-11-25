@@ -65,7 +65,7 @@ jobs:
           cat > latest.json <<EOF
           {
             "version": "${{ steps.ver.outputs.value }}",
-            "url": "https://github.com/chenxuuu/sms_forwarding/releases/latest/download/sms_forwarder-ota.bin",
+            "url": "https://github.com/syuraking/sms_forwarding_advance/releases/latest/download/sms_forwarder-ota.bin",
             "size": ${size},
             "sha256": "${sha}",
             "notes": "提交 ${{ github.sha }}"

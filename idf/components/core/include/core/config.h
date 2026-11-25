@@ -38,6 +38,7 @@ typedef enum {
     PUSH_TYPE_FEISHU = 8,
     PUSH_TYPE_GOTIFY = 9,
     PUSH_TYPE_TELEGRAM = 10,
+    PUSH_TYPE_WXPUSHER = 11,
 } push_type_t;
 
 typedef struct {

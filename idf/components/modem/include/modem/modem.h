@@ -67,6 +67,14 @@ void modem_set_net_event_handler(modem_net_cb_t cb);
 
 const char *modem_model(void);
 
+/**
+ * 来电回调：模组上报 +CLIP 时触发（同一通来电的重复振铃只回调一次）。
+ * 在 AT 读取任务里同步调用，回调必须快速返回（只投递，不做网络 IO）。
+ * @param number 来电号码；号码被隐藏或未上报时为空字符串。
+ */
+typedef void (*modem_call_cb_t)(const char *number);
+void modem_set_call_handler(modem_call_cb_t cb);
+
 /** 发送短信（阻塞，直到模组返回 OK/ERROR 或超时）。 */
 bool modem_send_sms(const char *phone, const char *text, uint32_t timeout_ms);
 
@@ -107,12 +115,3 @@ typedef struct {
  * @param url 形如 https://host/path，path 支持 ?a=b 查询串。
  */
 bool modem_http_get(const char *url, modem_http_result_t *out, uint32_t timeout_ms);
-
-/**
- * 复核「短信直报」配置（+CNMI=2,2 / +CMGF=0），被模组清掉就重新下发。
- *
- * ML307Y 在 CFUN 复位后（SIM 重新 +CPIN: READY 前后）会把 +CNMI 恢复成默认的
- * 0,0,0,0,0，之后不再上报 +CMT，表现为「收不到短信且日志毫无动静」。网络守护
- * 每分钟调一次即可；配置正常时只是多一条 AT+CNMI? 查询。
- */
-void modem_sms_config_check(void);

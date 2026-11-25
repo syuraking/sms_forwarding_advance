@@ -36,28 +36,6 @@ static void request_free(push_request_t *req)
     sbuf_free(&req->body);
 }
 
-/* 判断 JSON 里某个布尔字段是否为 true（容忍 ": true" 这种带空格的写法） */
-static bool json_bool_true(const char *resp, const char *key)
-{
-    size_t klen = strlen(key);
-    const char *p = resp;
-    while ((p = strstr(p, key)) != NULL) {
-        const char *q = p + klen;
-        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') {
-            q++;
-        }
-        if (*q == ':') {
-            q++;
-            while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') {
-                q++;
-            }
-            return strncmp(q, "true", 4) == 0;
-        }
-        p += klen;
-    }
-    return false;
-}
-
 /* 部分平台 HTTP 200 但业务失败，需要检查响应体 */
 static bool body_is_success(const push_channel_t *ch, const char *resp)
 {
@@ -70,44 +48,21 @@ static bool body_is_success(const push_channel_t *ch, const char *resp)
     case PUSH_TYPE_PUSHPLUS:
         return strstr(resp, "\"code\":200") != NULL;
     case PUSH_TYPE_TELEGRAM:
-        return json_bool_true(resp, "\"ok\"");
+        return strstr(resp, "\"ok\":true") != NULL;
+    case PUSH_TYPE_WXPUSHER:
+        return strstr(resp, "\"code\":1000") != NULL;
     default:
         return true;
     }
 }
 
-typedef struct {
-    char buf[512];
-    size_t len;
-} http_body_t;
-
-/* esp_http_client_perform() 会自己把响应体读掉，不留给 esp_http_client_read_response()。
- * 所以在事件回调里顺手存一份，用来做业务成功判断。 */
-static esp_err_t http_on_data(esp_http_client_event_t *evt)
-{
-    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data) {
-        http_body_t *body = (http_body_t *)evt->user_data;
-        if (evt->data_len > 0 && body->len < sizeof(body->buf) - 1) {
-            size_t room = sizeof(body->buf) - 1 - body->len;
-            size_t n = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
-            memcpy(body->buf + body->len, evt->data, n);
-            body->len += n;
-            body->buf[body->len] = '\0';
-        }
-    }
-    return ESP_OK;
-}
-
 static bool execute_once(const push_channel_t *ch, const push_request_t *req,
                          const char *name, int *status_out)
 {
-    http_body_t acc = {0};
     esp_http_client_config_t cfg = {
         .url = sbuf_cstr(&req->url),
         .timeout_ms = 10000,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .event_handler = http_on_data,
-        .user_data = &acc,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -137,11 +92,11 @@ static bool execute_once(const push_channel_t *ch, const push_request_t *req,
     *status_out = status;
     log_line("[%s] 响应码: %d", name, status);
 
-    const char *resp = acc.buf;
-    if (acc.len > 0) {
+    char resp[512] = {0};
+    int n = esp_http_client_read_response(client, resp, sizeof(resp) - 1);
+    if (n > 0) {
+        resp[n] = '\0';
         log_line("[%s] 响应: %s", name, resp);
-    } else {
-        log_line("[%s] 响应体为空", name);
     }
 
     if (status >= 200 && status < 300) {
@@ -208,6 +163,62 @@ static void build_texts(const char *title, const char *message, const char *time
     sbuf_free(&s_title);
     sbuf_free(&s_msg);
     sbuf_free(&s_time);
+}
+
+/**
+ * WxPusher 接收方：key2 里用英文逗号/分号/空格分隔，
+ *  - 以 "UID_" 开头的条目 → uids（个人推送）
+ *  - 纯数字条目           → topicIds（主题订阅推送）
+ * 其余条目忽略，输出形如 ,"uids":["UID_x"],"topicIds":[123]
+ */
+static void wxpusher_append_targets(sbuf_t *out, const char *key2)
+{
+    sbuf_t uids, topics;
+    sbuf_init(&uids);
+    sbuf_init(&topics);
+
+    const char *p = key2;
+    while (*p) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        const char *start = p;
+        while (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t' && *p != '\r' &&
+               *p != '\n') {
+            p++;
+        }
+        size_t n = (size_t)(p - start);
+        if (n == 0) {
+            continue;
+        }
+        char tok[96];
+        if (n >= sizeof(tok)) {
+            continue;
+        }
+        memcpy(tok, start, n);
+        tok[n] = '\0';
+
+        bool all_digits = true;
+        for (size_t i = 0; i < n; i++) {
+            if (tok[i] < '0' || tok[i] > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (strncmp(tok, "UID_", 4) == 0) {
+            sbuf_t esc;
+            sbuf_init(&esc);
+            util_json_escape(&esc, tok);
+            sbuf_printf(&uids, "%s\"%s\"", uids.len ? "," : "", sbuf_cstr(&esc));
+            sbuf_free(&esc);
+        } else if (all_digits) {
+            sbuf_printf(&topics, "%s%s", topics.len ? "," : "", tok);
+        }
+    }
+
+    sbuf_printf(out, ",\"uids\":[%s],\"topicIds\":[%s]", sbuf_cstr(&uids), sbuf_cstr(&topics));
+    sbuf_free(&uids);
+    sbuf_free(&topics);
 }
 
 static void build_request(const push_channel_t *ch, const char *title, const char *message,
@@ -382,6 +393,24 @@ static void build_request(const push_channel_t *ch, const char *title, const cha
         break;
     }
 
+    case PUSH_TYPE_WXPUSHER: {
+        sbuf_printf(&req->url, "%s",
+                    ch->url[0] ? ch->url : "https://wxpusher.zjiecode.com/api/send/message");
+        sbuf_t s_token;
+        sbuf_init(&s_token);
+        util_json_escape(&s_token, ch->key1);
+        /* contentType=1 纯文本；summary 限 20 字，超长（按字节保守判断）就省略，由服务端截取 content */
+        sbuf_printf(&req->body, "{\"appToken\":\"%s\",\"content\":\"%s\",\"contentType\":1",
+                    sbuf_cstr(&s_token), sbuf_cstr(&content));
+        if (title && title[0] && strlen(title) <= 20) {
+            sbuf_printf(&req->body, ",\"summary\":\"%s\"", sbuf_cstr(&s_title));
+        }
+        wxpusher_append_targets(&req->body, ch->key2);
+        sbuf_append(&req->body, "}");
+        sbuf_free(&s_token);
+        break;
+    }
+
     default:
         log_line("[%s] 未知推送类型 %d", ch->name, ch->type);
         break;
@@ -423,15 +452,8 @@ bool push_send_channel(const push_channel_t *channel, const char *title, const c
             request_free(&req);
             return true;
         }
-        /* 只有"可能没送到"的情况才重试：网络错误（status==0）、5xx、429。
-         * 2xx 说明平台已经收到并给出应答，即使业务字段判失败，重试也只会让用户收到重复通知。 */
-        const bool retryable = (status == 0) || status >= 500 || status == 429;
-        if (!retryable) {
-            if (status >= 200 && status < 300) {
-                log_line("[%s] 请求已送达（HTTP %d），不再重试", name, status);
-            } else {
-                log_line("[%s] 客户端错误 %d，跳过重试", name, status);
-            }
+        if (status >= 400 && status < 500 && status != 429) {
+            log_line("[%s] 客户端错误 %d，跳过重试", name, status);
             break;
         }
     }

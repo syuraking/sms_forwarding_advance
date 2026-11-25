@@ -4,7 +4,7 @@
 
 ### log（`core/log.h`）
 
-串口控制台 + Web 环形缓冲（200 行 × 192 字节，超长行从 UTF-8 字符边界截断）双写。
+串口控制台 + Web 环形缓冲（200 行 × 256 字节）双写。
 
 | 接口 | 说明 |
 |---|---|
@@ -41,7 +41,6 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
 | `at_client_init()` | 安装 UART1（TX=3/RX=4/115200）+ 启动读任务 |
 | `at_command()` | 发指令，收集应答直到 OK/ERROR/超时；期间 URC 转交回调 |
 | `at_command_wait_for()` | 等到包含关键字的行（用于 `+MPING:` 这类上报） |
-| `at_command_capture()` | 捕获含指定前缀的**整行原文**，用于 `+CGLA` 这类几 KB 的单行应答 |
 | `at_send_pdu()` | `AT+CMGS=<len>` → 等 `>` → PDU+0x1A → 等 OK |
 | `at_set_urc_handler()` | 注册 URC 回调 |
 
@@ -62,13 +61,6 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
   输出 UTF-8 文本与长短信 `ref/part/total`。
 - 解码校验（防止畸形 PDU 产生乱码通知）：时间戳范围（月 1-12、日 1-31、时分秒范围）、
   DCS 必须是文本编码（GSM7/UCS2）、UDL 与实际数据长度一致、UDH 长度自洽。任一不满足即返回失败。
-- **7bit 长短信的 UDH 对齐**：6 字节 UDH = 48 bit，但 GSM 7bit 数据必须从下一个整 septet 边界
-  （第 49 bit，即 7 个 septet）开始，中间那 1 bit 是填充位。按 48 bit 解会让每个字符错位 1 bit，
-  解出来是 `¡Ñ§ΩΛ` 这类乱码（issue #37 的“邮件乱码”就是这个）。UDL 也要按
-  `UDH septet 数 + 文本 septet 数` 校验，长度不符直接判畸形。
-- **emoji / 非 BMP 字符**：UCS2 用 UTF-16 代理对表示。解码时把 `D800-DBFF` + `DC00-DFFF` 合成一个码点，
-  落单的代理项替换成 U+FFFD；编码时把非 BMP 码点拆成代理对。不做这层处理会输出 CESU-8（`ED B9 89`），
-  既显示成 `������`，又因为不是合法 UTF-8 让 `/log` 的 JSON 解析失败、网页日志页白屏。
 
 ### sms_assembler
 
@@ -81,13 +73,7 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
 
 - 作业队列（初始化 / 发送短信 / 原始 AT / ping / HTTP 访问 / 软重启 / 硬重启），作业对象在堆上传递；
 - 初始化流程：EN 断电重启 → `AT` 握手 → `ATI` 识别型号 → `AT+CGACT=0,1`（ML307Y 跳过）
-  → `apply_sms_config()`（`AT+CNMI=2,2,0,0,0` + `AT+CMGF=0`）→ `AT+COPS`（按配置选网）
-  → `AT+CEREG?` 等注册 → 注册后再跑一次 `modem_sms_config_check()`；
-- **`+CNMI` 会被模组清掉，必须兜底复核**：实测 ML307Y 在 `AT+CFUN=1` 之后约 8 秒（SIM 重新
-  `+CPIN: READY`）把 `+CNMI` 恢复成默认的 `0,0,0,0,0`，此后一条 `+CMT` 都不上报，日志毫无动静。
-  `modem_sms_config_check()` 用 `AT+CNMI?` 读回校验（要求 mode=2、mt=2），不对就重新下发；
-  `+CPIN: READY` 时置脏标记立即复核，平时由 netmon 每轮顺带查一次（内部每 10 轮约 10 分钟才真查）；
-  `rf_cycle()` 在 `CFUN=1` 后先等 SIM READY、再多等 3 秒才配置，避开那次清零；
+  → `AT+CNMI=2,2,0,0,0` → `AT+CMGF=0` → `AT+CLIP=1` → `AT+COPS`（按配置选网）→ `AT+CEREG?` 等注册；
 - `modem_ping_ip(ip)`：`AT+MPING="<ip>",30,1` → 解析延迟/TTL；默认目标 `qq.com`，
   `modem_ping()` 是其兼容包装。**不执行 CGACT**（见下方说明）；
 - `modem_http_get(url)`：保号流量操作——`AT+MHTTPDEL=0` → `AT+MHTTPCREATE="<scheme>://<host>"`
@@ -96,6 +82,9 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
   返回收到的 body 字节数。公网可达性取决于 SIM 运营商（默认 cloudflare 网址在国内蜂窝网络下常不可达）。
 - **ML307Y 禁止 CGACT**：这颗模组执行 `AT+CGACT=1,1` / `CGACT=0,1` 会触发重启，
   重启后可能长时间搜不到网。保号操作直接依赖注册后可用的数据连接，不手动开关。
+- 来电显示：初始化时执行 `AT+CLIP=1`（失败只记日志，不影响短信）。来电时模组每次振铃都会上报
+  `+CLIP: "号码",...`，`handle_clip()` 解析号码并通过 `modem_set_call_handler()` 注册的回调通知上层；
+  同一号码 20 秒内的重复振铃只回调一次，收到 `NO CARRIER` / `BUSY` 后重置，号码被隐藏时回调参数为空串；
 - 初始化时打开 `AT+CREG=2` / `AT+CEREG=2`，注册状态变化会以 URC 出现在日志里（相同状态去重）；
 - `detect_self_phone()`：初始化时执行 `AT+CNUM` 读取 SIM 卡本机号码。配置里 `self_phone` 为空
   才写入并落盘（NVS 键 `selfPhone`）；已手填则保留用户值，两者不一致只打一行日志提示；
@@ -106,8 +95,7 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
 ### netmon（蜂窝网络守护）
 
 - 每 60 秒用 `AT`、`AT+CPIN?`、`AT+CREG?`、`AT+CEREG?`、`AT+CSQ`、`AT+CFUN?` 检查一次，
-  全部是**信令查询，不发短信、不激活数据连接，零资费**；每轮开头还会调一次
-  `modem_sms_config_check()`（多数轮次只是空跑，不打 AT）；
+  全部是**信令查询，不发短信、不激活数据连接，零资费**；
 - 连续 2 次确认未注册才判定掉线；已注册但连续 3 次 `CSQ=99`（读不到信号）同样视为射频卡死；
 - 自愈阶梯：`AT+CFUN=4 → AT+CFUN=1 → AT+COPS`（射频重启 + 按配置重新选网；
   第 1 级的飞行模式保持时长按 TCP 式退避：首次 10 秒，每次失败翻倍，上限 5 分钟，
@@ -125,11 +113,7 @@ EN 引脚（GPIO5，低电平断电）与板载 LED（GPIO8，低电平点亮）
 
 ## net
 
-- `wifi_start()`：STA 连接，20s 超时；断线后 3s 退避重连；账号 NVS 优先、Kconfig 兜底；
-- `wifi_portal_start()`：没有任何账号、或连续 3 次连不上已保存的账号时，开热点
-  `SMS-Forwarder-XXXX`（开放）+ 配网页 `http://192.168.4.1/`：扫描附近 2.4G 列表，
-  保存后写 NVS `sms_wifi`（`ssid`/`pass`）并重启；`/*` 通配把手机探测请求 302 回首页；
-  实现见 `net/wifi_portal.c`；
+- `wifi_start()`：STA 连接，20s 超时；断线后 3s 退避重连；
 - `wifi_get_info()`：SSID/IP/网关/掩码/DNS/MAC/BSSID/信道/RSSI；
 - `wifi_reconnect()`：供 Web “重启 WiFi” 使用；
 - `wifi_kick()`：非阻塞踢一次重连，供心跳使用；
@@ -150,6 +134,7 @@ EN 引脚（GPIO5，低电平断电）与板载 LED（GPIO8，低电平点亮）
 
 - 队列 + 工作任务的异步通知模型，调用方只投递；
 - `notify_sms()`：一条短信 → 邮件 + 所有有效推送通道（文案"📱短信通知"）；
+- `notify_call()`：来电提醒 → 邮件 + 所有有效推送通道（文案"🔔 来电提醒 / 来电号码: …"，内部走 `notify_system()`）；
 - `notify_system()`：系统事件 → 邮件 + 所有有效推送通道（文案"🔔 标题"）；
 - 邮件是否发送由 `config_mail_active()` 判定：邮件开关 `mail_enabled` 打开 **且** SMTP 四项齐全；
   关闭开关后短信照常转发到推送通道，只是不再发邮件；
@@ -177,16 +162,14 @@ EN 引脚（GPIO5，低电平断电）与板载 LED（GPIO8，低电平点亮）
 | 飞书机器人 | 8 | url + key1(secret) |
 | Gotify | 9 | url + key1(token) |
 | Telegram | 10 | key1(chat_id) + key2(bot token)，url 可填反代前缀 |
+| WxPusher | 11 | key1(appToken) + key2(UID_… 或主题 ID，多个用逗号分隔)，url 可空 |
 
 本机号码 `self_phone` 由 `config.self_phone` 提供（后台手填，或启动时 AT+CNUM 自动获取）：
-文本型通道（钉钉/飞书/PushPlus/Server酱/Gotify/Telegram）在文案末尾自动追加「本机号码: …」，
+文本型通道（钉钉/飞书/PushPlus/Server酱/Gotify/Telegram/WxPusher）在文案末尾自动追加「本机号码: …」，
 POST JSON 多一个 `self_phone` 字段，GET 多一个 `self_phone` 查询参数，Bark 追加到 body，
 自定义模板用 `{self_phone}` 占位符自行摆放。
 
-响应体业务码校验（钉钉/飞书/PushPlus/Server酱/Telegram）：`esp_http_client_perform()` 会把响应体读走，
-所以响应体要在 `HTTP_EVENT_ON_DATA` 回调里自己攒一份，`esp_http_client_read_response()` 只能拿到空串。
-重试只看「可能没送到」：传输层失败（status=0）、5xx、429 最多 3 次；2xx 已送达不再重试，
-否则一条短信会推 2~3 条通知。
+响应体业务码校验（钉钉/飞书/PushPlus/Server酱/Telegram/WxPusher，WxPusher 要求 code=1000）与 4xx 不重试策略与旧版一致。
 
 ## forwarder
 
@@ -198,6 +181,9 @@ POST JSON 多一个 `self_phone` 字段，GET 多一个 `self_phone` 查询参�
 4. 管理员号码 + `RESETPASS` → 后台账号密码恢复默认（admin/admin123）并写入 NVS →
    `notify_system()` 发到所有已启用通道，正文带默认账号密码与设备地址，等待通知队列后返回；
 5. 其它 → `notify_sms()`。
+
+来电：modem 的来电回调把号码投递进同一个转发队列（`is_call`），黑名单命中则忽略（号码被隐藏时不做黑名单判断），
+否则 `notify_call()`。来电只做通知，不接听、不挂断。
 
 ## sched（定时任务）
 
@@ -211,50 +197,14 @@ POST JSON 多一个 `self_phone` 字段，GET 多一个 `self_phone` 查询参�
 - 单次任务执行完把 `next` 清零并停用，UI 显示「已结束」
 - 每次执行结果都会调用 `notify_system()`：任务号、类型、详情、执行时间、下次执行时间
 
-## ota（固件升级）
-
-- 独立组件，分区为 `otadata` + 两个 app 槽（各 `0x1F0000`），nvs 位置/大小不变；
-- **只支持网页手动上传**，不做自动下载/自动安装；
-- 上传：`ota_begin(size)` 预检 → 首块 4 KB 校验 `esp_app_desc_t`
-  （magic + `project_name == "sms_forwarder"`）→ `esp_ota_begin` 擦非活动槽 →
-  流式 `esp_ota_write` → `esp_ota_end` → `esp_ota_set_boot_partition`；
-- 失败、断电、连接中断都只影响非活动槽，当前固件照常启动；
-- 版本号 = `PROJECT_VER`（构建时间 `YYYYMMDD.HHMM`，CI 注入），定宽可字典序比较；
-- 回滚：开启 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`，`ota_init()` 发现
-  `ESP_OTA_IMG_PENDING_VERIFY` 就起确认任务，联网（含配网热点）稳定 45 秒后
-  `esp_ota_mark_app_valid_cancel_rollback()`；一直连不上则下次复位自动回退；
-- 版本检查**不在设备端**：打开后台即由浏览器 fetch `api.github.com/.../releases/latest`，读 Release 标题
-  （CI 把标题写成 `YYYYMMDD.HHMM`）与 `assets` 里的下载地址，结果缓存进 `localStorage` 12 小时；
-  设备不联网、不跑 TLS，`/ota_check` 接口与 8 KB 检查任务已删除（空闲堆 24 KB → 40 KB）；
-- 组件只依赖 `core` / `app_update` / `bootloader_support` / `esp_app_format` / `net` / `notify`，
-  不再需要 `esp_http_client` 与 `mbedtls`。
-
-## esim（eSIM 管理）
-
-- 通过模组逻辑通道指令 `AT+CCHO` / `AT+CGLA` / `AT+CCHC` 把 ES10b/ES10c 请求送进 eUICC，
-  DER 编解码自己实现（只覆盖用到的定长 tag + 长度 + 值）；
-- `esim_get_eid()`：`BF3E 03 5C 01 5A`；`esim_list_profiles()`：`BF2D` + tagList；
-  `esim_enable_profile()`：`BF31 { A0 { 5A/4F, 81 01 refresh } }`；
-- `esim_delete_profile()`：`BF33 { 5A/4F }`（**不套 `A0`**，套了 eUICC 回结果码 1）；
-  先读列表拒删「使用中」的配置，没有 `BF34`（EuiccMemoryReset，会清空整张卡）；
-- 组件内一把互斥锁，列表/切卡整段串行；临时缓冲全部走 heap（峰值约 11 KB），不占 httpd 栈；
-- 切卡成功后由 web 层起 3 KB 任务，延迟 2 秒软重启模组（`AT+CFUN=1,1`）重新注册；
-- 透传接口 `esim_channel_open/close/transmit` 供 `/esim/apdu` 使用，单条 APDU ≤255 字节。
-
 ## web
 
-- `web_server_start()`：80 端口，Basic 认证，5 个 socket，LRU 清理，`max_uri_handlers = 40`（当前注册 34 条）；
+- `web_server_start()`：80 端口，Basic 认证，5 个 socket，LRU 清理；
 - 首页：读取 `EMBED_TXTFILES` 内嵌的 `web/index.html`，替换 17 个 `%KEY%` 占位符，
   推送通道表单片段动态生成，按 2KB 分块发送；
 - 长耗时接口用 `httpd_req_async_handler_begin()` 转独立任务，响应完成后
   `httpd_req_async_handler_complete()`；
-- 请求体解析：`application/x-www-form-urlencoded`，字段按需更新（兼容旧版多表单提交）；
-- 页面约 270 KB（内联 CSS/JS + 本地二维码解码库），`EMBED_TXTFILES` 打进固件，按 2 KB 分块发送；
-- **中英双语**：`index.html` 内置 `I18N`（中文原文 → 英文，约 190 条）和 `I18N_FRAG`（拼接片段）；
-  首次打开按 `navigator.languages` 判断（`zh*` → 中文，其它 → 英文），顶栏「自动 / 中文 / EN」可手动切，
-  模式存 `localStorage.lang`。静态文案和动态渲染共用一套逻辑：`walkI18n()` 遍历文本与
-  placeholder/title/aria-label，`MutationObserver` 监听新插入节点自动补翻，切回中文时从节点缓存的原串恢复。
-  新增界面文案要同时补进字典，否则英文界面会残留中文。
+- 请求体解析：`application/x-www-form-urlencoded`，字段按需更新（兼容旧版多表单提交）。
 
 ### 界面结构（web/index.html）
 
@@ -289,12 +239,9 @@ POST JSON 多一个 `self_phone` 字段，GET 多一个 `self_phone` 查询参�
   过滤 chip「全部/错误/短信/网络/通知/AT指令」，原始 AT 交互以 `AT>` 开头统一弱显示
 - 开/关飞行模式后立即把模组就绪状态同步为 false，首页不再误报「已就绪」；
   关飞行模式后由 netmon 检测到重新注册再置 true
-- 侧栏固定 9 个页面：概览 / 推送通道（邮件、推送通道、号码黑名单）/ 设备（选网配置、模组信息查询、维护）/
-  eSIM 管理（EID、配置列表、切卡、二维码解析导入）/ 保号发送（发短信、Ping、HTTP 访问）/
-  后台管理（账号、管理员号码）/ 日志（日志 + AT 指令）/
-  固件升级（当前/最新版本、检查更新、上传 `*-ota.bin`，有新版本时导航项带红点）/ 关于项目；
-  「发短信」并入保号页，「AT 指令」并入日志页，避免功能分散；
-  固件升级页的强调色固定为黑色（`PAGES` 里 `mono:true`，覆盖 `--pri`/`--pri2`），与其余页面的彩色主题区分
+- 侧栏固定 7 个页面：概览 / 推送通道（邮件、推送通道、号码黑名单）/ 设备（选网配置、模组信息查询、维护）/
+  保号发送（发短信、Ping、HTTP 访问）/ 后台管理（账号、管理员号码）/ 日志（日志 + AT 指令）/ 关于项目；
+  「发短信」并入保号页，「AT 指令」并入日志页，避免功能分散
 - 邮件通道可关闭：邮件卡片右上角「启用」开关，关闭后 notify_sms/notify_system 只发推送通道，
   状态标签显示「已关闭」；NVS 键 `mailEnable` 缺失时按开启处理，老配置升级后行为不变
 - 主题：深色 / 浅色 / 跟随系统（默认跟随），偏好存 localStorage
