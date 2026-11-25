@@ -1,187 +1,234 @@
-<p align="center"><b>简体中文</b> | <a href="README.en.md">English</a></p>
+# 短信转发器（ESP-IDF 版）
 
-<div align="center">
+ESP32-C3 SuperMini + ML307R（ML307Y）4G 模组的低成本短信转发器：
+收到短信后通过 **邮件 + 多种 HTTP 推送通道** 通知，并提供内嵌 Web 管理界面。
 
-<img src="assets/photo.png" width="168" alt="短信转发器实物">
+本目录是从 Arduino 版本（仓库根目录 `code/`）移植到 **ESP-IDF v6.1.1** 的完整实现，
+使用官方组件模型、FreeRTOS 任务与 `esp_http_server` 重写。
 
-# 低成本短信转发器
-
-**一张 4G 卡（实体 SIM 或 eSIM）+ 一块 ESP32-C3，把收到的短信在几秒内推到邮件、钉钉、飞书、微信、Telegram**
-
-[![License](https://img.shields.io/github/license/chenxuuu/sms_forwarding?style=flat-square&color=4f7cff)](LICENSE)
-[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.1.1-e7352c?style=flat-square)](idf/)
-[![MCU](https://img.shields.io/badge/MCU-ESP32--C3-5b8cff?style=flat-square)](#硬件)
-[![Firmware](https://img.shields.io/github/actions/workflow/status/chenxuuu/sms_forwarding/firmware.yml?style=flat-square&label=%E5%9B%BA%E4%BB%B6%E6%9E%84%E5%BB%BA)](../../actions/workflows/firmware.yml)
-[![Release](https://img.shields.io/github/v/release/chenxuuu/sms_forwarding?style=flat-square&label=%E6%9C%80%E6%96%B0%E5%9B%BA%E4%BB%B6&color=22b8a6)](../../releases/latest)
-[![Demo](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E7%8E%A9%E4%B8%80%E4%B8%8B-8b5cf6?style=flat-square)](https://sms.j2.cx/)
-
-[在线演示](https://sms.j2.cx/) · [硬件采购](#硬件) · [烧录](#烧录) · [视频教程](https://www.bilibili.com/video/BV1cSmABYEiX) · [常见问题](#常见问题)
-
-</div>
-
-<img src="assets/flow.svg" width="100%" alt="原理：SIM 或 eSIM 卡收到短信，4G 模组经 UART 交给 ESP32-C3，再通过 WiFi 推送到邮件与各种平台；一张 eSIM 里有多套配置、会自动切换（不是多张卡），也可以在网页上切卡、删卡；ESP32-C3 负责解码和定时保号，再推到多个通道">
-
-> **老方案在哪**：[`old-luatos` 分支](https://github.com/chenxuuu/sms_forwarding/tree/old-luatos)、[`code/`](code/)（[Arduino 框架版](code/README.md)）  
-> 当前主线是 [`idf/`](idf/)。
->
-> **免责声明**：本项目仅供个人学习与自用。请遵守所在地法律法规、运营商条款与短信服务协议；
-> 转发内容可能涉及他人隐私，请自行确认你有权处理。因使用本项目产生的费用、封号或法律风险由使用者自行承担。
->
-> **功能边界**：只做短信接收、转发与保号。  
->多张实体卡同时待机（多卡控制）、通话、拨号、开放接口、自动化（自动回复 / 自动操作） **永远不会支持**，请勿提出相关 issue 或 PR。
-
-## 它解决什么问题
-
-给设备插一张手机卡（Nano SIM，或支持 eUICC 的 eSIM 卡），开机后连上 WiFi 并盯着 4G 模组。
-任何人给这张卡发短信，设备会解析内容、合并长短信、过滤黑名单，然后**同时**转发到你配置的渠道。
-
-- **不需要服务器、不需要公网 IP**：设备直连邮件服务器和推送平台，短信内容不经过任何中转
-- **硬件约 28 元**，插一根 USB 线就能 7×24 挂着，长期挂着建议配个 5V 电源
-- **专为"养卡"设计**：低流量保号操作 + 定时任务，让卡保持活跃又不烧钱
-- **eSIM 也能管**：网页里读 EID 和配置列表、一键切卡 / 删卡；扫运营商的二维码或粘贴激活码，直接生成写卡命令（写卡在电脑上跑，不占设备资源）
-
-## 界面
-
-固件内置完整网页（约 270 KB，含本地二维码解码库，直接嵌在 Flash 里），手机上也能用。
-界面中英双语：首次打开按浏览器语言自动选择（中文区默认中文，其它默认英文），右上角可随时手动切换。
-主题支持深色 / 浅色 / 跟随系统。
-
-| 概览 | 推送通道 | eSIM 管理 |
-|---|---|---|
-| [<img src="assets/web-overview.png" alt="概览页">](https://sms.j2.cx/#overview) | [<img src="assets/web-push.png" alt="推送通道页">](https://sms.j2.cx/#push) | [<img src="assets/web-esim.png" alt="eSIM 管理页">](https://sms.j2.cx/#esim) |
-
-## 功能一览
-
-| 能力 | 说明 |
-|---|---|
-| **推送通道** | 邮件 + POST JSON / GET / Bark / 钉钉 / 飞书 / PushPlus / Server酱 / Gotify / Telegram / 自定义模板；默认 5 个槽位、最多 50 个，可随时启用停用，每个都能单独点「测试」 |
-| **长短信** | PDU 模式解码，多段长短信 30 秒内自动拼合，中文不乱码 |
-| **黑名单** | 按号码过滤验证码轰炸和骚扰短信 |
-| **远程命令** | 管理员号码发 `SMS:号码:内容` 远程发短信、`RESET` 重启、`RESETPASS` 重置后台密码并推送新密码 |
-| **保号** | 模组 Ping / 访问指定网址（默认只下 10 字节），按需消耗余额 |
-| **定时任务** | 指定时间自动发短信 / Ping / 访问网址；错过时间会补执行，失败只重试 1 次；可设「每 N 天」循环 |
-| **固件升级** | 网页上传 `*-ota.bin` 即可升级，写备用分区、断电不砖；打开后台就能看到有没有新版本（浏览器直接查 GitHub，设备不联网），起不来自动回滚 |
-| **eSIM 管理** | 读出卡里的配置、一键切换或删除（使用中的配置不允许删，切完自动重启模组重新注册）；扫码或粘贴激活码即可拿到导入命令 |
-| **自动恢复** | WiFi 掉线重连；4G 掉网按「飞行模式（10 秒起，翻倍至 5 分钟）→ 软重启 → 断电重启」分级自愈，连续 5 轮失败才提醒 |
-| **配置兼容** | NVS 命名空间与键名和 Arduino 版一致，可从老固件直接升级，配置不丢 |
-
-## 硬件
-
-**不想焊接**：直接买成品套件，成本和自己攒一样（支持移动 / 联通 / 电信卡）
-
-- [小蓝鲸 WIFI 短信宝](https://item.taobao.com/item.htm?id=1003711355912)（找客服问）
-- [4G FPC 天线](https://item.taobao.com/item.htm?id=1003711355912&skuId=6162872574943)（与开发板同购）
-
-**自己接**：总成本约 ¥27.8（价格会浮动；DIY 方案目前实测支持移动 / 联通卡）
-
-- ESP32-C3 开发板：[SuperMini](https://item.taobao.com/item.htm?id=852057780489&skuId=5813710390565)，¥9.5 包邮
-- 4G 模组：[小蓝鲸 ML307R-DC 核心板](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥16.3 包邮
-- [4G FPC 天线](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥2，与核心板同购
-- Nano SIM 卡一张（支持 eUICC 的 eSIM 卡也可以，见下一节）+ 5 根杜邦线
-
-<p align="center"><img src="assets/wiring.svg" width="780" alt="接线：GPIO5→EN、GPIO3→RX、GPIO4→TX、GND 共地、5V→VCC"></p>
-
-> 模组跑的是出厂 AT 固件，**不用刷机、不用改**，只当"能收短信的串口猫"用。
-
-## eSIM（可选）
-
-除了普通 Nano SIM，插一张 **eUICC 卡**（9eSIM、5ber、ESTK 等）就能在网页上管理多个运营商配置：
-
-- 读 EID、列出卡里的所有配置（名称、ICCID、AID、是否启用）
-- 一键切换；不需要的可以删掉——**正在使用中的配置不允许删除**，删除还要手输 ICCID 确认
-- 扫运营商的二维码（浏览器本地解码，不上传）或粘贴 `LPA:1$…` 激活码，页面直接生成写卡命令
-- 写卡（下载新配置）不在设备上做：SGP.22 要连 SM-DP+ 做 TLS 和几十 KB 的加密安装包，ESP32-C3 扛不住。
-  用仓库里的 `tools/esim_bridge.py` 把电脑上 lpac 的 APDU 转发到设备即可，效果和在网页上点一下一样
-
-完整步骤（装 lpac、下载、切卡、删除、常见报错）见 **[idf/docs/esim-import.md](idf/docs/esim-import.md)**。
-
-## 烧录
-
-两种方式，选一种即可。
-
-### 方式一：烧现成固件（不用装编译环境）
-
-1. 从 [Releases](../../releases/latest) 下载 `sms_forwarder-merged.bin`
-2. 烧录（Chrome / Edge 打开 [ESP Launchpad](https://espressif.github.io/esp-launchpad/)）：
-   - 芯片选 **ESP32-C3**，地址填 `0x0`，选刚下载的 `sms_forwarder-merged.bin`
-   - 或命令行：`esptool.py --chip esp32c3 -p COM3 write_flash 0x0 sms_forwarder-merged.bin`
-3. 配网：连热点 `SMS-Forwarder-XXXX`（无密码）→ 打开 <http://192.168.4.1/> → 选 WiFi、输密码 → 自动重启入网
-
-> **已经在用的设备别烧整包**：整包会用 0xFF 覆盖 NVS，配置全丢。
-> 用 `idf.py flash`，或只写 `0x0/0x8000/0x20000` 三段；装好后也能直接在后台「固件升级」上传 ota 包。
-
-固件在每次推送后由 GitHub Actions 自动构建，功能和源码编译的完全一致。
-
-### 方式二：自己编译
-
-需要 **ESP-IDF v6.1.1**（[官方安装器](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32c3/get-started/index.html)）和一根 USB-C 数据线。
+## 快速开始
 
 ```bash
-git clone https://github.com/chenxuuu/sms_forwarding.git
-cd sms_forwarding/idf
-idf.py build            # 首次约 3~5 分钟
-idf.py -p COM3 flash    # 串口按实际改：Windows 是 COMx，Linux 是 /dev/ttyACM0
+# 1. 编译
+idf.py -C idf build          # 或在 idf/ 目录下直接 idf.py build
+
+# 2. 烧录（按实际串口修改）
+idf.py -C idf -p COM3 flash
+
+# 3. 查看日志（USB-Serial/JTAG 控制台）
+python idf/tools/serial_capture.py COM3 60
 ```
 
-烧完同样按方式一的第 3 步配网。要批量烧多台，可以 `idf.py menuconfig → 短信转发器配置` 预填 WiFi，跳过配网。
+首次开机先进配网模式（见下文「配网（WiFi）」），连热点填好 WiFi 后，再访问 `http://<设备IP>/`
+（默认账号 `admin` / `admin123`）配置邮件与推送通道。
 
-### 首次配置
+## 找不到设备 / 长期运行
 
-1. 浏览器打开 `http://<设备IP>/`，或 mDNS 域名 `http://sms-xxxx.local/`（后缀见串口日志）
-2. 默认账号 `admin` / `admin123`，**登录后立刻到「后台管理」改掉**
-3. 「推送通道」填邮箱或任一通道，点「测试」确认能收到
-4. 「后台管理」填管理员手机号（之后可用短信远程操作）和本机号码（推送里会带上）
-5. 用 eSIM 的话打开「eSIM 管理」：能读到 EID 和配置列表就说明卡正常；装新配置按 [导入指南](idf/docs/esim-import.md) 走
+设备 IP 是路由器 DHCP 分的，**会变**（实测过一夜从 `.8` 变成 `.6`），所以别把 IP 写死到书签里：
 
-## 常见问题
+- 设备 IP 变化时会通过**所有通道**（邮件 + 已启用的推送）发「设备网络地址已变化」，里面是最新地址；
+- 也可以用 mDNS 固定域名访问：`http://sms-9e3c.local/`（后缀是 MAC 后两字节，见下）；
+- 想彻底稳定：在路由器上给它的 MAC 做 **DHCP 静态绑定**，或改成静态 IP；
+- 设备自带心跳自愈，见下。
 
-| 现象 | 原因与处理 |
-|---|---|
-| 一直显示"重连中"、收不到短信 | 4G 模组没注册上。先看日志里的 `+CEREG`，模组偶发假死时**断一次电**最快；长期挂机建议用独立 5V 电源，别用电脑 USB |
-| 设备 IP 老在变 | 路由器 DHCP 分配的。设备地址变化时会推通知；想固定就在路由器给它的 MAC 做静态绑定，或直接用 mDNS 域名 |
-| 换了路由器 / 改了 WiFi 密码 | 设备连续 3 次启动连不上会自动开热点 `SMS-Forwarder-XXXX`，连上去重新填一次即可；也可以提前在 `menuconfig` 里改好再烧录 |
-| 想换运营商 / 锁网 | 「设备 → 选网配置」选手动，填 PLMN（移动 `46000`、联通 `46001`、电信 `46011`），保存后重启 |
-| 推送失败但网页正常 | 先点该通道的「测试」看具体报错；多数是 token / webhook 填错或平台侧限制 |
-| 固件升级页「检查失败」 | 版本检查是你的**浏览器**在请求 `api.github.com`，打不开就不会有提示，设备本身不受影响——直接去 [Releases](https://github.com/chenxuuu/sms_forwarding/releases) 下载 `*-ota.bin` 上传即可 |
-| eSIM 页读不到 EID | 卡不是 eUICC（普通 SIM 本来就不支持），或上一次操作没关干净逻辑通道。到「设备」页软重启模组再试 |
-| 切卡后一直"重连中" | 外卡漫游附着本来就慢，几分钟属正常；**能读到 ICCID 就说明卡没问题**。等不及可以到「设备」页软重启模组 |
-| 写卡报 `es9p_authenticate_client: Refused` | 激活码失效或被运营商限制，换一个激活码；lpac 用 2.2.1（2.3.0 的 Windows 包 stdio 后端有问题） |
+### mDNS 访问（固定域名）
 
-更多踩坑记录见 [idf/docs/build-flash.md](idf/docs/build-flash.md)。
-
-## 项目结构
+WiFi 连上后会发布 mDNS 服务，设备名默认取 MAC 后两字节：
 
 ```
-sms_forwarding/
-├── idf/                    # 主线：ESP-IDF v6.1.1 实现
-│   ├── components/         # core / modem / net / notify / forwarder / sched / ota / esim / web
-│   ├── docs/               # 架构、模块、接口、编译烧录文档
-│   └── tools/              # 串口抓日志脚本
-├── code/                   # 历史实现：Arduino 框架
-│   ├── dev_doc/            # Arduino 版的架构与接口文档
-│   └── README.md
-├── assets/                 # 图片、原理图、纯前端演示页
-├── tools/
-│   └── esim_bridge.py      # 把 lpac 的 APDU 转发到设备（电脑上跑）
-├── README.md               # 中文（默认）
-├── README.en.md            # 英文版
-└── .github/workflows/      # 固件构建、页面部署、Arduino 构建
+http://sms-9e3c.local/     # 本机 MAC 9c:cc:01:c4:9e:3c → 后缀 9e3c
 ```
 
-想改代码？先读 [idf/docs/architecture.md](idf/docs/architecture.md) 和 [idf/docs/modules.md](idf/docs/modules.md)，
-项目约定写在 [AGENTS.md](AGENTS.md)（日志、配置锁、新增推送通道的步骤都在里面）。
+- **多台同固件设备不会冲突**：名字由 MAC 决定，天然唯一；路由器客户端列表里也会显示这个名字。
+- 想自定义：`idf.py menuconfig` → 短信配发器配置 → `mDNS 设备名`，但**每台必须不同**，
+  否则两台会抢同一个名字（mDNS 只能有一个应答者）。
+- mDNS 是链路本地组播，**只在同一个二层网络内有效**；跨网段/走路由访问请用 IP。
 
-## License
+### 心跳与自愈
 
-本项目以 [MIT](LICENSE) 协议开源。
+每 **60 秒**做两项检查（间隔与目标可用 `idf.py menuconfig` 调整）：
 
-eSIM 与二维码部分用到或参考了下面的项目，按各自协议使用：
-
-| 项目 | 协议 | 用途 |
+| 检查 | 失败判定 | 处理 |
 |---|---|---|
-| [jsQR](https://github.com/cozmo/jsQR) | Apache-2.0 | 网页端二维码解码（内嵌在后台页面里，协议全文见 [`idf/components/web/web/jsQR.LICENSE.txt`](idf/components/web/web/jsQR.LICENSE.txt)） |
-| [lpac](https://github.com/estkme-group/lpac) | AGPL-3.0 / LGPL-2.1 | eSIM（SGP.22）流程参考；作为**独立程序**在电脑上运行，固件不包含其代码 |
-| [euicc-go](https://github.com/damonto/euicc-go) | MIT | eSIM APDU 流程参考 |
+| 本机 Web（连自己的 IP:80） | 连续 2 次无响应 | 服务已挂，**重启设备** |
+| 外网（DNS 解析 + TCP 连 `www.baidu.com:80`） | 连续 3 次不可达 | 主动重连 WiFi |
+| 同上 | 连续 6 次不可达 | 打印告警并继续重试，**不重启**（避免断网时反复重启） |
 
-完整步骤（装 lpac、下载、切卡、删除）见 [idf/docs/esim-import.md](idf/docs/esim-import.md)，
-协议细节与设计取舍见 [idf/docs/esim-plan.md](idf/docs/esim-plan.md)。
+外网恢复后会通知「设备网络已恢复」。每小时打一条「心跳正常：IP / 空闲堆 / 运行时长」，
+方便从 `/log` 观察长期运行状态。
+
+### 4G 基站掉线自愈
+
+模组开机注册后可能因为子区重选、运营商踢网或射频卡死而静默离线，自己不会重新注册。
+固件内置「蜂窝网络守护」，每 **60 秒**用 AT 信令查询一次（`AT+CREG?` / `AT+CEREG?` /
+`AT+CSQ` / `AT+CPIN?`）——**不发短信、不激活数据连接，不产生话费与流量**：
+
+| 阶段 | 处理 |
+|---|---|
+| 连续 2 次查不到注册（或已注册但读不到信号） | 判定掉线，日志记录掉线时间点 |
+| 第 1 级 | 飞行模式 `CFUN=4` 保持 10 秒（失败后翻倍，最多 5 分钟）→ `CFUN=1` + 按配置选网，等 90 秒 |
+| 第 2 级 | 软重启模组 `AT+CFUN=1,1` |
+| 第 3 级 | EN 引脚断电硬重启模组 |
+| 三级都失败 | 记日志，冷却 5 分钟后从第 1 级重试 |
+
+**通知规则**：日常掉线→自动重连只写日志（`/log` 页面和串口都能看到），不发任何通知；
+只有连续 5 轮（每轮含一次飞行模式重启 + 软/硬重启）都失败时才发一次「4G 网络无法自动重连」，
+正文说明从哪个时间点开始掉线；之后恢复再发一条「4G 网络已恢复」。
+用户手动开启飞行模式时守护会暂停，不会擅自把射频打开。
+
+### 选网配置（自动 / 手动）
+
+设备页「选网配置」卡片可选择：
+
+| 模式 | 初始化时执行 | 说明 |
+|---|---|---|
+| 自动（默认） | `AT+COPS=0` | 由模组自动选择运营商与网络 |
+| 手动 | `AT+COPS=1,2,"<PLMN>",<AcT>` | 按 PLMN 锁定运营商，并指定 LTE / 3G / 2G |
+
+- PLMN 为 MCC+MNC 的 5~6 位数字：中国移动 `46000`、中国联通 `46001`、中国电信 `46011`；
+- `<AcT>`：`7`=LTE、`2`=3G（UTRAN）、`0`=2G（GSM）；
+- 配置持久化在 NVS（键名 `operatorMode` / `operatorCode` / `operatorAct`，前两个与 Arduino 版兼容），
+  **保存后需重启设备**，在模组初始化时通过 `AT+COPS` 应用；
+- 网络守护做射频重启时也会重新应用该配置，不会把手动选网覆盖成自动。
+
+### 保号操作（Ping / HTTP 流量）
+
+「保号发送」页的「保号操作」卡片提供两种主动联网方式，用于保持 SIM 卡在线：
+
+| 功能 | 默认参数 | 说明 |
+|---|---|---|
+| Ping | `qq.com` | 模组 `AT+MPING` 探测目标，显示延迟与 TTL，可输入任意 IP/域名 |
+| HTTP 访问 | `https://speed.cloudflare.com/__down?bytes=10` | 模组主动 GET 指定网址，返回收到的 body 字节数 |
+
+默认网址末尾的 `bytes=10` 表示只下载 10 字节 body，**流量非常可控**；可自行改成更大数值。
+执行 HTTP 访问前会弹窗提醒「会产生流量消耗，请确保目标页面数据量可承受」。
+公网可达性取决于 SIM 运营商——默认 cloudflare 网址在国内蜂窝网络下常返回模组错误码 5，
+此时换成可访问的网址即可。
+
+> **重要**：这两项操作**不会**执行 `AT+CGACT=1,1` / `CGACT=0,1`。ML307Y 在该型号上执行 CGACT
+> 会触发模组重启，重启后可能长时间无法重新注册基站（表现为掉线且自愈也难恢复）。
+> 模组注册后数据连接本就可用，直接用 MPING / MHTTP 即可，切勿人为开关数据连接。
+
+> 供电提醒：本板通过 USB 供电时，PC 睡眠/重启会让 USB 重新枚举，芯片跟着复位
+> （日志里 `复位原因: 11` = `ESP_RST_USB`）。长期挂机建议用独立的 5V 电源适配器。
+
+### 定时任务
+
+保号发送页可以配置定时任务（最多 8 个），到点自动执行 **发送短信 / Ping / 访问网址**：
+
+- 选好日期时间即可；设备发现时间已过（关机、重启、断网错过）会**补执行**一次，日志标注「已超时 N 分钟」
+- 模组没就绪时任务保持待执行，不会消耗掉
+- 失败只重试 1 次（间隔 30 秒），因为短信和流量都要花钱
+- 循环任务填「每 N 天」：下次时间按原计划 +N 天推进，错过多个周期时直接跳到最近的未来节点，不会一次连发
+- 每次执行结果都会推送到所有通知通道（任务号、详情、执行时间、下次时间）
+- 单次任务执行完自动停用，列表里显示「已结束」
+
+## Web 页面结构
+
+左侧导航固定 9 个页面：
+
+| 页面 | 内容 |
+|---|---|
+| 概览 | 设备地址、运行时长、内存、模组状态、最近动态、通知链路 |
+| 推送通道 | 邮件通知（可单独「测试邮件」）、推送通道列表（每个通道可单独「测试」）、号码黑名单 |
+| 设备 | 选网配置、模组信息查询、维护（飞行模式 / 重启） |
+| eSIM 管理 | EID、卡内配置列表、切换启用、删除未启用配置、二维码解析（本地解码）与导入命令 |
+| 保号发送 | 发送短信、Ping、HTTP 访问（保号操作）、定时任务、本次会话发送记录 |
+| 固件升级 | 当前版本、手动上传 `*-ota.bin`；最新版本由浏览器直接查 GitHub（有新版本时侧边栏显示红点） |
+| 后台管理 | 后台账号密码、管理员手机号 |
+| 日志 | 实时日志（可过滤 / 暂停跟随）、AT 指令执行 |
+| 关于项目 | 项目地址、固件版本、设备信息 |
+
+管理员手机号发来的短信可当命令用：`SMS:号码:内容` 远程发短信、`RESET` 重启设备、
+`RESETPASS` 把后台账号密码重置为默认值（重置后会把默认账号密码和当前设备地址推送到所有已启用通道，
+方便在忘记密码时找回；请登录后立即修改）。
+
+邮件通道是**可选**的：邮件卡片右上角有「启用」开关，关闭后短信与系统通知只发到推送通道。
+开关存 NVS 键 `mailEnable`；老固件没有该键，升级后按「开启」处理，行为与原来一致，不会丢邮件配置。
+
+### 来电提醒
+
+设备在配置短信上报时会同时打开来电显示（`AT+CLIP=1`）。有来电时，号码会像短信一样推送到邮件和所有已启用的推送通道
+（标题「来电提醒」，正文「来电号码: …」，并带时间与本机号码）：
+
+- 同一通来电的重复振铃只通知一次；挂断后（或超过 20 秒）再次来电会重新通知；
+- 号码被对方隐藏时显示「未知号码（号码未显示）」；
+- 号码黑名单同样对来电生效；
+- 设备只通知，不会接听或挂断；能否收到来电提示取决于模组与 SIM 卡是否支持语音（如 VoLTE）。
+
+### 本机号码
+
+后台管理页可填写本机（SIM 卡）号码；留空时每次启动都会用 `AT+CNUM` 尝试自动读取，
+读不到就保持为空（国内不少卡没有写号码，属正常）。号码用途：
+
+- 钉钉/飞书/PushPlus/Server酱/Gotify/Telegram/WxPusher 正文、Bark 的 body 末尾自动追加「本机号码: …」（未配置时省略）
+- POST JSON 载荷多一个 `self_phone` 字段，GET 渠道多一个 `self_phone` 查询参数
+- 自定义模版可用 `{self_phone}` 占位符和 `{sender}` `{message}` `{timestamp}` 一起用
+
+## 配网（WiFi）
+
+设备没法在没网的时候打开 Web 页面，所以配网走**热点 + 表单**，不需要编译环境：
+
+1. 烧录后开机，设备发现没有 WiFi 账号，会开热点 `SMS-Forwarder-XXXX`（XXXX 是 MAC 后两字节，**无密码**）；
+2. 手机或电脑连上该热点，浏览器打开 <http://192.168.4.1/>（手机连上后通常会自动弹出来）；
+3. 页面里选一个扫到的 2.4G 网络（也可以手动输入），填密码，点「保存并重启」；
+4. 设备把账号写进 NVS 并重启，之后直接入网，热点自动消失。
+
+账号优先级：**NVS（配网写入）> menuconfig（编译期常量）**。编译期常量在第一次启动时会自动写进 NVS，
+所以之后升级到不带 WiFi 默认值的固件（CI 构建的包）也不会掉线。
+
+```powershell
+cd idf
+idf.py menuconfig      # 可选：短信转发器配置 → WiFi SSID / WiFi 密码，预置后跳过配网
+idf.py build flash
+```
+
+- Kconfig 的默认值是空的，实际值保存在 `sdkconfig`（已 `.gitignore`），**不会把家里的 WiFi 密码提交到仓库**。
+- 只支持 2.4G；SSID 含 `#`、空格等字符时，Kconfig 生成的 sdkconfig 已自动加引号，配网页面则原样填写即可。
+- **路由器改了密码**？设备连续 3 次启动连不上会自动重新开热点，连上去重填一次即可，不用重新烧录。
+- 换路由器、搬家同理，都走热点；Web 页面上的「重启 WiFi」只是断开重连，不改账号。
+- 配网页面只在没有账号 / 连不上时才出现，正常运行时监听 80 端口的是主界面。
+
+## 目录结构
+
+```
+idf/
+├── CMakeLists.txt          # 顶层工程
+├── sdkconfig.defaults      # 默认配置（含内存/TLS 调优）
+├── partitions.csv          # 4MB Flash 分区表
+├── main/                   # 启动流程与业务装配
+├── components/
+│   ├── core/               # 日志、NVS 配置、字符串工具
+│   ├── modem/              # AT 通道、PDU 编解码、长短信合并、模组作业队列
+│   ├── net/                # WiFi 管理、SNTP 时间同步
+│   ├── notify/             # 邮件（SMTP over TLS）、HTTP 推送通道
+│   ├── forwarder/          # 转发策略：黑名单、管理员命令、通知分发
+│   └── web/                # esp_http_server + 内嵌前端页面
+├── tools/serial_capture.py # 串口抓取脚本（不会复位设备）
+└── docs/                   # 开发文档
+```
+
+## 开发文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 分层架构、任务模型、关键数据流 |
+| [docs/modules.md](docs/modules.md) | 各组件职责与接口 |
+| [docs/api.md](docs/api.md) | HTTP 接口说明 |
+| [docs/build-flash.md](docs/build-flash.md) | 编译、烧录、调试与实测记录 |
+| [docs/ota-plan.md](docs/ota-plan.md) | 固件升级（OTA）开发计划与实现记录 |
+| [docs/esim-import.md](docs/esim-import.md) | eSIM 导入指南：装 lpac、下载、切卡、删除、常见问题 |
+| [docs/esim-plan.md](docs/esim-plan.md) | eSIM 管理：协议笔记、导入方案评审、测试计划与实测记录 |
+
+## 与 Arduino 版本的差异
+
+- **配置兼容**：NVS 命名空间 `sms_config` 与键名完全一致，从 Arduino 固件升级后无需重新配置。
+- **自实现 PDU 编解码**：替代 pdulib，支持 GSM 7bit / UCS2、长短信 UDH、字母数字发送方。
+- **自实现 SMTP 客户端**：替代 ReadyMail，基于 `esp_tls`（465 端口隐式 TLS）。
+- **Web 界面按块输出**：不申请 40KB 连续内存，避免 C3 上大块分配失败。
+- **长耗时接口异步化**：发送短信、ping、模组重启等通过 `httpd_req_async_handler_begin` 处理，不阻塞 HTTP 服务。
+- **限制**：单条短信发送最大 70 个汉字 / 160 个英文字符（与旧版能力一致，超长会明确报错而不是静默失败）。
+
+- **动态推送通道**：数量可增删（默认 5，上限 50），NVS 键名不变，旧配置原样兼容。
+- **配置变更通知**：只在真的有改动时发送，正文列出改了什么；改密码才提示使用新密码。
+- **三态主题**：深色 / 浅色 / 跟随系统（默认跟随）。
