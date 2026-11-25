@@ -18,6 +18,7 @@
 #include "net/mdns.h"
 #include "net/wifi.h"
 #include "notify/notify.h"
+#include "ota/ota.h"
 #include "web/web_ui.h"
 #include "web_internal.h"
 
@@ -93,16 +94,23 @@ static void url_decode(const char *src, char *out, size_t cap)
 
 bool web_query_get(httpd_req_t *req, const char *key, char *out, size_t cap)
 {
-    char query[512];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    /* 查询串长度不固定：/decode 的 PDU、/at 的命令都可能上百上千字节。
+     * 以前 query/value 都写死 512，长参数会被静默截断，这里按实际长度从堆上分配。 */
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen == 0 || qlen > 4096) {
         return false;
     }
-    char value[512];
-    if (httpd_query_key_value(query, key, value, sizeof(value)) != ESP_OK) {
-        return false;
+    char *query = malloc(qlen + 1);
+    char *value = malloc(qlen + 1);
+    bool ok = query && value &&
+              httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK &&
+              httpd_query_key_value(query, key, value, qlen + 1) == ESP_OK;
+    if (ok) {
+        url_decode(value, out, cap);
     }
-    url_decode(value, out, cap);
-    return true;
+    free(query);
+    free(value);
+    return ok;
 }
 
 char *web_read_body(httpd_req_t *req)
@@ -207,6 +215,12 @@ static void async_task(void *arg)
     const char *content_type = "application/json; charset=utf-8";
     ctx->fn(ctx, &out, &content_type);
 
+    /* 栈余量不足时留条线索，避免以后加大处理逻辑时莫名其妙崩在别的任务里 */
+    UBaseType_t stack_left = uxTaskGetStackHighWaterMark(NULL);
+    if (stack_left < 512) {
+        log_line("异步处理栈只剩 %u 字节，请给该处理器加大栈大小", (unsigned)stack_left);
+    }
+
     httpd_resp_set_type(ctx->req, content_type);
     httpd_resp_set_hdr(ctx->req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(ctx->req, sbuf_cstr(&out), out.len);
@@ -217,18 +231,31 @@ static void async_task(void *arg)
     vTaskDelete(NULL);
 }
 
-esp_err_t web_spawn_async3(httpd_req_t *req, web_async_fn fn, const char *arg1, const char *arg2,
-                           const char *arg3)
+/* 异步任务起不来时也要给浏览器一个明确答复，否则前端只会看到连接被断开 */
+static void async_spawn_fail(httpd_req_t *req, bool copy_ready, httpd_req_t *copy)
+{
+    httpd_resp_set_status(copy_ready ? copy : req, "503 Service Unavailable");
+    httpd_resp_set_type(copy_ready ? copy : req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(copy_ready ? copy : req,
+                       "{\"success\":false,\"message\":\"设备内存紧张，请稍后重试\"}");
+    if (copy_ready) {
+        httpd_req_async_handler_complete(copy);
+    }
+}
+
+esp_err_t web_spawn_async3_ex(httpd_req_t *req, web_async_fn fn, const char *arg1, const char *arg2,
+                              const char *arg3, size_t stack)
 {
     httpd_req_t *copy = NULL;
     esp_err_t err = httpd_req_async_handler_begin(req, &copy);
     if (err != ESP_OK) {
         log_line("异步响应初始化失败: %s", esp_err_to_name(err));
+        async_spawn_fail(req, false, NULL);
         return err;
     }
     web_async_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
-        httpd_req_async_handler_complete(copy);
+        async_spawn_fail(req, true, copy);
         return ESP_ERR_NO_MEM;
     }
     ctx->req = copy;
@@ -236,12 +263,23 @@ esp_err_t web_spawn_async3(httpd_req_t *req, web_async_fn fn, const char *arg1, 
     snprintf(ctx->arg1, sizeof(ctx->arg1), "%s", arg1 ? arg1 : "");
     snprintf(ctx->arg2, sizeof(ctx->arg2), "%s", arg2 ? arg2 : "");
     snprintf(ctx->arg3, sizeof(ctx->arg3), "%s", arg3 ? arg3 : "");
-    if (xTaskCreate(async_task, "web_async", 10240, ctx, 4, NULL) != pdPASS) {
-        httpd_req_async_handler_complete(copy);
+    if (xTaskCreate(async_task, "web_async", stack, ctx, 4, NULL) != pdPASS) {
+        log_line("异步任务创建失败（栈 %u 字节），当前最大连续堆 %u 字节", (unsigned)stack,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         free(ctx);
+        async_spawn_fail(req, true, copy);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+esp_err_t web_spawn_async3(httpd_req_t *req, web_async_fn fn, const char *arg1, const char *arg2,
+                           const char *arg3)
+{
+    /* 默认 6 KB：绝大多数处理器只是拼字符串查 AT，1~2 KB 就够。
+     * C3 空闲堆里最大的连续块常常只有 6~8 KB，10 KB 栈会让请求直接起不来。
+     * 走 TLS 的处理器（推送测试、邮件测试、自检）单独要 8 KB，见各自调用处。 */
+    return web_spawn_async3_ex(req, fn, arg1, arg2, arg3, 6144);
 }
 /* ---- 页面与配置 ---- */
 esp_err_t handler_root(httpd_req_t *req)
@@ -312,9 +350,6 @@ static uint32_t hash_section(const app_config_t *c, int section)
         h = fnv1a(&c->operator_mode, sizeof(c->operator_mode), h);
         h = fnv1a(&c->operator_act, sizeof(c->operator_act), h);
         h = fnv1a(c->operator_code, sizeof(c->operator_code), h);
-        break;
-        h = fnv1a(c->channels, (size_t)c->channel_count * sizeof(push_channel_t), h);
-        h = fnv1a(&c->channel_count, sizeof(c->channel_count), h);
         break;
     }
     return h;
@@ -427,8 +462,13 @@ esp_err_t handler_save(httpd_req_t *req)
     char cnt_str[8] = {0};
     if (web_form_get(body, "pushCount", cnt_str, sizeof(cnt_str))) {
         int n = atoi(cnt_str);
-        if (n != cfg->channel_count) {
-            config_set_channel_count(n);
+        if (n != cfg->channel_count && !config_set_channel_count(n)) {
+            /* 调整通道数要重新分配数组；失败时不能继续，否则会出现
+             * 「提示保存成功、实际通道数没变」的假成功。 */
+            config_unlock();
+            free(body);
+            web_send_json(req, false, "内存不足，无法调整通道数量");
+            return ESP_OK;
         }
     }
     for (int i = 0; i < cfg->channel_count; i++) {
@@ -550,18 +590,96 @@ esp_err_t handler_save(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * 日志量大会超过最大连续堆块（C3 碎片严重时只有 7-8KB），
+ * 所以不再一次性拼 JSON，而是按 2KB 分块流式发送。
+ */
+typedef struct {
+    httpd_req_t *req;
+    char buf[2048];
+    size_t len;
+    bool first;
+    bool failed;
+} log_chunk_t;
+
+static void log_flush(log_chunk_t *c)
+{
+    if (!c->failed && c->len > 0) {
+        if (httpd_resp_send_chunk(c->req, c->buf, c->len) != ESP_OK) {
+            c->failed = true;
+        }
+    }
+    c->len = 0;
+}
+
+static void log_putc(log_chunk_t *c, char ch)
+{
+    if (c->failed) {
+        return;
+    }
+    if (c->len + 1 >= sizeof(c->buf)) {
+        log_flush(c);
+    }
+    if (!c->failed) {
+        c->buf[c->len++] = ch;
+    }
+}
+
+static void log_puts(log_chunk_t *c, const char *s)
+{
+    while (*s) {
+        log_putc(c, *s++);
+    }
+}
+
 esp_err_t handler_log(httpd_req_t *req)
 {
     if (!web_require_auth(req)) {
         return ESP_OK;
     }
-    sbuf_t out;
-    sbuf_init(&out);
-    log_append_json(&out);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-    httpd_resp_send(req, sbuf_cstr(&out), out.len);
-    sbuf_free(&out);
+
+    log_chunk_t c = {.req = req, .first = true};
+    log_putc(&c, '[');
+
+    int n = log_line_count();
+    for (int i = 0; i < n && !c.failed; i++) {
+        char line[LOG_LINE_MAX];
+        if (!log_copy_line(i, line, sizeof(line))) {
+            break;
+        }
+        if (!c.first) {
+            log_putc(&c, ',');
+        }
+        log_putc(&c, '"');
+        for (const char *p = line; *p; p++) {
+            unsigned char ch = (unsigned char)*p;
+            switch (ch) {
+            case '"': log_puts(&c, "\\\""); break;
+            case '\\': log_puts(&c, "\\\\"); break;
+            case '\n': log_puts(&c, "\\n"); break;
+            case '\r': log_puts(&c, "\\r"); break;
+            case '\t': log_puts(&c, "\\t"); break;
+            default:
+                if (ch < 0x20) {
+                    char tmp[8];
+                    snprintf(tmp, sizeof(tmp), "\\u%04x", ch);
+                    log_puts(&c, tmp);
+                } else {
+                    log_putc(&c, (char)ch);
+                }
+            }
+        }
+        log_putc(&c, '"');
+        c.first = false;
+    }
+    log_putc(&c, ']');
+    if (c.failed) {
+        return ESP_OK; /* 客户端提前断开，响应已作废 */
+    }
+    log_flush(&c);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -605,11 +723,21 @@ esp_err_t handler_status(httpd_req_t *req)
     }
     config_unlock();
 
-    sbuf_printf(&out,
-                "\"email_ok\":%s,\"mail_enabled\":%s,\"push_count\":%d,\"self_phone\":\"%s\","
-                "\"device_name\":\"%s\",\"model\":\"%s\"}",
-                email_ok ? "true" : "false", mail_enabled ? "true" : "false", push_count,
-                self_phone, host, modem_model());
+    ota_info_t ota;
+    ota_get_info(&ota);
+
+    /* self_phone 是用户手填的，可能带引号；device_name / model 也一样，
+     * 直接塞进 JSON 会把整段状态响应弄坏，前端连状态都读不出来。 */
+    sbuf_printf(&out, "\"email_ok\":%s,\"mail_enabled\":%s,\"push_count\":%d,\"self_phone\":\"",
+                email_ok ? "true" : "false", mail_enabled ? "true" : "false", push_count);
+    util_json_escape(&out, self_phone);
+    sbuf_append(&out, "\",\"version\":\"");
+    util_json_escape(&out, ota.current);
+    sbuf_printf(&out, "\",\"ota_state\":%d,\"device_name\":\"", (int)ota.state);
+    util_json_escape(&out, host);
+    sbuf_append(&out, "\",\"model\":\"");
+    util_json_escape(&out, modem_model());
+    sbuf_append(&out, "\"}");
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, sbuf_cstr(&out), out.len);
@@ -658,7 +786,9 @@ esp_err_t handler_config(httpd_req_t *req)
         append_str_field(&out, "url", ch->url, true);
         append_str_field(&out, "key1", ch->key1, true);
         append_str_field(&out, "key2", ch->key2, true);
-        append_str_field(&out, "body", ch->custom_body, false);
+        /* 键名必须和前端 / 配置结构体一致（custom_body）：之前这里写成 body，
+         * 前端读不到模板内容，每次保存都会被空串覆盖，自定义模板等于存不进去。 */
+        append_str_field(&out, "custom_body", ch->custom_body, false);
         sbuf_append(&out, "}");
     }
     sbuf_append(&out, "]}");
@@ -697,7 +827,7 @@ esp_err_t web_server_start(void)
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
-    cfg.max_uri_handlers = 32;
+    cfg.max_uri_handlers = 40;
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {
@@ -734,6 +864,11 @@ esp_err_t web_server_start(void)
     register_uri(s_server, "/wifi", HTTP_POST, handler_wifi);
     register_uri(s_server, "/system", HTTP_GET, handler_system);
     register_uri(s_server, "/system", HTTP_POST, handler_system);
+    register_uri(s_server, "/ota", HTTP_GET, handler_ota);
+    register_uri(s_server, "/ota", HTTP_POST, handler_ota_upload);
+    register_uri(s_server, "/esim", HTTP_GET, handler_esim);
+    register_uri(s_server, "/esim", HTTP_POST, handler_esim_enable);
+    register_uri(s_server, "/esim/apdu", HTTP_POST, handler_esim_apdu);
 
     log_line("HTTP 服务器已启动: http://%s/", wifi_ip());
     return ESP_OK;

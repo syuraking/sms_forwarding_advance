@@ -325,11 +325,10 @@ bool config_push_channel_valid(const push_channel_t *ch)
     case PUSH_TYPE_PUSHPLUS:
     case PUSH_TYPE_SERVERCHAN:
         return ch->key1[0] != '\0';
-    case PUSH_TYPE_WXPUSHER:
-        return ch->key1[0] != '\0' && ch->key2[0] != '\0';
     case PUSH_TYPE_GOTIFY:
         return ch->url[0] != '\0' && ch->key1[0] != '\0';
     case PUSH_TYPE_TELEGRAM:
+    case PUSH_TYPE_WXPUSHER:
         return ch->key1[0] != '\0' && ch->key2[0] != '\0';
     default:
         return false;

@@ -3,6 +3,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "esim/esim.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "forwarder/forwarder.h"
@@ -13,7 +14,9 @@
 #include "net/mdns.h"
 #include "net/time_sync.h"
 #include "net/wifi.h"
+#include "net/wifi_portal.h"
 #include "notify/notify.h"
+#include "ota/ota.h"
 #include "sched/sched.h"
 #include "web/web_server.h"
 
@@ -65,13 +68,31 @@ void app_main(void)
     notify_init();
     forwarder_init();
     sched_init();
+    ota_init(); /* 版本号、回滚确认、每日版本检查都在这里起步 */
 
     esp_err_t err = wifi_start(20000);
     if (err != ESP_OK) {
-        if (!wifi_configured()) {
-            /* 没配 WiFi：不重启，保持控制台可读，方便 menuconfig 后重新烧录 */
+        /* 没账号，或连续 3 次都连不上已保存的账号（多半是路由器改了密码）：
+         * 开热点让人用手机配网，配好自动重启，避免设备永远失联。 */
+        bool need_portal = !wifi_configured() || wifi_boot_fails() >= 3;
+        if (need_portal) {
+            if (!wifi_configured()) {
+                log_line("还没有 WiFi 账号，进入配网模式");
+            } else {
+                log_line("连续 %d 次连不上 %s，进入配网模式重新设置", wifi_boot_fails(), wifi_ssid());
+            }
+            if (wifi_portal_start() == ESP_OK) {
+                char hint[128];
+                snprintf(hint, sizeof(hint), "手机连热点 %s（无密码），浏览器打开 http://192.168.4.1/",
+                         wifi_portal_ssid());
+                log_line("%s", hint);
+                while (1) {
+                    vTaskDelay(pdMS_TO_TICKS(60000));
+                }
+            }
+            log_line("配网模式启动失败，保持控制台可读（60 秒后重试提示）");
             while (1) {
-                log_line("设备未配置 WiFi，无法联网。请 menuconfig 填写后重新烧录（60s 后再次提示）");
+                log_line("设备未配置 WiFi，无法联网");
                 vTaskDelay(pdMS_TO_TICKS(60000));
             }
         }
@@ -93,6 +114,7 @@ void app_main(void)
     heartbeat_start(on_net_event, ip);
     modem_set_net_event_handler(on_modem_event);
     modem_start();
+    esim_init();
 
     char url[48];
     snprintf(url, sizeof(url), "http://%s/", ip);

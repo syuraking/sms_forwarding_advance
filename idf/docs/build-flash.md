@@ -68,8 +68,21 @@ python tools/serial_capture.py COM3 60
 
 ## 5. WiFi 配置（配网）
 
-**没有运行时配网**：设备必须先联网才能提供 Web 配置页面，所以 WiFi 账号是编译期常量，
-沿用旧固件的做法（旧版在 `code/wifi_config.h`）。
+设备不可能在没网的时候打开 Web 页面，所以有两种给账号的方式，**优先用热点配网**：
+
+### 5.1 热点配网（推荐，不需要编译环境）
+
+| 步骤 | 说明 |
+|---|---|
+| 触发条件 | 启动时没有任何账号，或连续 3 次连不上已保存的账号（路由器改密码） |
+| 热点 | `SMS-Forwarder-XXXX`，XXXX = MAC 后两字节，开放网络（无密码） |
+| 页面 | <http://192.168.4.1/>，扫描附近 2.4G 网络并列出（按信号排序），也可手输 SSID |
+| 保存后 | 写入 NVS namespace `sms_wifi`（键 `ssid` / `pass`），1.5 秒后自动重启入网 |
+| 手机探测 | `/*` 通配把 `/generate_204`、`/hotspot-detect.html` 等 302 回首页，多数手机会自动弹出页面 |
+
+实现：`components/net/src/wifi_portal.c`（`wifi_portal_start()`），AP+STA 模式，DHCP 服务由 esp_netif 提供。
+
+### 5.2 编译期预置（适合批量烧录）
 
 ```powershell
 idf.py menuconfig      # 短信转发器配置 → WiFi SSID / WiFi 密码
@@ -78,15 +91,18 @@ idf.py build flash
 
 | 项 | 说明 |
 |---|---|
-| 配置符号 | `CONFIG_WIFI_SSID` / `CONFIG_WIFI_PASSWORD` |
-| 定义位置 | `main/Kconfig.projbuild`（默认值为空） |
-| 生效位置 | `components/net/src/wifi.c` 的 `load_credentials()`，仅在启动连接时读取 |
-| 持久化 | 值存在 `sdkconfig`（gitignore），NVS 不参与 |
-| 修改方式 | 只能重新 menuconfig + 编译 + 烧录；Web 的「重启 WiFi」仅重连 |
-| 未配置时 | 串口提示「设备未配置 WiFi…」，不进入重启循环，便于重新烧录 |
+| 配置符号 | `CONFIG_WIFI_SSID` / `CONFIG_WIFI_PASSWORD`（`main/Kconfig.projbuild`，默认空） |
+| 读取优先级 | `wifi.c: load_credentials()` 先读 NVS，读不到才用 Kconfig |
+| 持久化 | Kconfig 值在 `sdkconfig`（gitignore），**首次启动会写进 NVS**；配网写入的值也在 NVS，重启不丢 |
+| 未配置时 | 不重启循环，直接进配网热点；串口同时打印热点名与 192.168.4.1 |
 
-> 之所以把 Kconfig 默认值留空：真实 WiFi 密码不应该跟着仓库走。当前这台机器的
-> `sdkconfig` 里已经有可用值，直接 `idf.py build` 仍然正常；**删掉 sdkconfig 后要重新填**。
+> 之所以把 Kconfig 默认值留空：真实 WiFi 密码不应该跟着仓库走。**删掉 sdkconfig 后要重新填**
+> （或者干脆走热点配网，完全不用碰 sdkconfig）。
+
+**踩过的坑**：早期 Kconfig 里的账号只在内存里用，从来不落盘。这种设备一旦 OTA 到 CI 构建的固件
+（CI 没有 `CONFIG_WIFI_*`），NVS 里又没存过账号，重启后就是"未配置 WiFi"直接进配网模式，
+看起来像配置全丢了（其实只是 WiFi）。现在 `load_credentials()` 第一次用到 Kconfig 值时就会
+`wifi_save_credentials()` 写进 NVS，之后任何固件都能连上。
 
 ## 6. 内存与 TLS 调优（sdkconfig.defaults）
 
@@ -128,6 +144,7 @@ idf.py build flash
 | mDNS | 发布 `http://sms-9e3c.local/`；跨网段（本机在 192.168.31.x，设备在 192.168.1.x）无法解析，属链路本地限制 |
 | HTTPS 自检 | `https://www.baidu.com` 200、`https://p.papapoi.com` 200、`https://api.telegram.org` 连接被重置（该网络不可达） |
 | 配置保存 / 重启 | `/save` 落盘并回显；`/system?action=restart` 重启后自动重连、模组重新就绪 |
+| 热点配网 | 清空 WiFi 账号后启动 → 热点 `SMS-Forwarder-9E3C` 起来、192.168.4.1 出页面、扫到 6 个邻居网络；POST `/save` 后重启，用 NVS 里的账号（含 `#` 的 SSID）连上并拿到原 IP |
 
 ## 8. 一个容易踩的 TLS 坑
 
@@ -140,11 +157,60 @@ idf.py build flash
 `skip_cert_common_name_check`**，SNI 才会正常发送。若确实需要连自签名内网服务，
 再单独评估（会牺牲 SNI）。
 
+第二个坑是**入站记录缓冲太小**。`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` 曾为了省内存压到 4096，
+结果 smtp.qq.com 把三张证书记录（DigiCert RSA4096 三级链，5489 字节）塞进**一个** TLS 记录发出来，
+4096 装不下，握手直接失败。日志形如：
+
+```
+[邮件] TLS 握手失败 smtp.qq.com:465（tls=0x87 flags=0x0 可用堆 22 KB）
+```
+
+`tls=0x87` 就是 mbedTLS 的 `PSA_ERROR_NOT_SUPPORTED`（记录长度超限）。**不要误判成"协议版本不支持"**：
+同一台服务器只开 TLS 1.2、用 `ECDHE-RSA-AES128-GCM-SHA256` 也能正常握手。
+
+现在设为 **8192**。自查办法（电脑上就能看）：
+
+```bash
+# 证书链总大小；超过 IN_CONTENT_LEN 就会握手失败
+echo | openssl s_client -connect smtp.qq.com:465 -showcerts 2>/dev/null | grep -c "BEGIN CERTIFICATE"
+openssl s_client -connect smtp.qq.com:465 -tls1_2 -msg 2>&1 | grep "Certificate"
+```
+
+参考值：smtp.qq.com 5489 字节、www.baidu.com 4773 字节、常见反代 2~3KB。
+
 ## 9. 其它实测与坑
 
 | 场景 | 结论 |
 |---|---|
 | 动态通道 | 加到 6 个 -> /config 返回 6；缩回 5 后多余 NVS 键被删除 |
-| 路由数量 | 注册了 24 个 URI，max_uri_handlers 曾为 20，导致 /wifi、/system 404；现为 32 且注册失败会打日志 |
+| 路由数量 | 现在注册 34 个 URI（GET+POST），`max_uri_handlers` 设为 40；曾因写死 20 导致 /wifi、/system 404，注册失败会打日志 |
 | 界面交互 | agent-browser 实测：查询信号结果落面板、飞行模式开关回显 已开启/已关闭、主题三态切换正确 |
 | 保存表单 | 50 个通道的表单可能超过 16KB，请求体上限已放宽到 40KB |
+| 长短信乱码 | 7bit+UDH 的分段消息解出 `¡Ñ§ΩΛ` 乱码：UDH 结束后要从第 **49** bit（7 个 septet）开始解，按 48 bit 会整体错位 1 bit。已修，用 4 段真实 PDU + 构造的 4 段 GSM7 / 3 段 UCS2 用例回归 |
+| 短信被应答打断 | `+CMT` 与 PDU 之间夹了 `+CPIN: READY` 时旧逻辑会丢掉整条短信（长短信缺第 1 段）。现在等待期间不中断，5 秒 / 16 行才放弃 |
+| 短信里的 emoji 变乱码 / 日志页白屏 | UCS2 里的非 BMP 字符（emoji）是 UTF-16 代理对，旧代码把两个 16 位单元各按普通码点编码，出来是 CESU-8（`ED B9 89`），既显示成 `������`，又因为不是合法 UTF-8 让 `/log` 的 JSON 解析失败、日志页直接空白。现在编解码都按代理对合并/拆分，落单的代理项替换成 U+FFFD |
+| 短信突然收不到（连 URC 都没有） | ML307Y 在 `AT+CFUN=1` 之后约 8 秒、SIM 重新 `+CPIN: READY` 时会把 `+CNMI` 清回默认的 `0,0,0,0,0`，此后一条 `+CMT` 都不报。旧版 `rf_cycle()` 在 CFUN=1 后 2 秒就补发，正好被这次清零覆盖，设备从此「永久失聪」。现在 `rf_cycle()` 等 SIM READY 再多等 3 秒才配置，网络守护每轮用 `AT+CNMI?` 复核、发现被清就补发（日志：`短信直报配置被模组复位（+CNMI 不是 2,2），重新开启`）。排查同类问题先看一眼 `AT+CNMI?` |
+
+## 10. 调试期关掉掉电检测（Brownout）
+
+现象：串口反复打印 `Brownout detector was triggered` 然后重启，调试被打断。
+
+4G 模组发射瞬间电流能冲到 2 A，USB 供电被拉低到 2.5 V 附近就会触发。
+C3 默认阈值是 level 7（2.51 V，已是最低档），再往下没有可选项，只能在调试时关掉数字 BOD：
+
+```
+CONFIG_ESP_BROWNOUT_DET=n
+```
+
+已加在 `sdkconfig.defaults` 里（**发布固件前删掉**）。注意已有的 `sdkconfig` 不会自动跟随
+defaults 变化，要么删掉 `sdkconfig` 重新生成，要么直接把里面的
+`CONFIG_ESP_BROWNOUT_DET` 改成 `# CONFIG_ESP_BROWNOUT_DET is not set`。
+
+两点限制：
+
+- bootloader 还会打开**模拟 BOD**（`brownout_ll_ana_reset_enable(true)`，C3 ECO2 及以上固定行为），
+  这个关不掉。真掉到 2.5 V 以下仍会**静默复位**，只是不再打印那条日志。
+- 关掉后写 flash / OTA 期间掉压没有保护，可能写坏分区。调试完记得恢复。
+
+顺带一提，频繁触发说明供电确实不够：换短一点的 USB 线、插到能给 1 A 以上的口，
+或在模组供电脚并 1000 µF 以上的电容，比关检测更治本。
