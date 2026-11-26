@@ -117,7 +117,7 @@ void notify_call(const char *number)
 {
     const char *num = (number && number[0]) ? number : "未知号码（号码未显示）";
     char body[96];
-    snprintf(body, sizeof(body), "来电号码: %s", num);
+    snprintf(body, sizeof(body), "来电号码: %s（对方已挂断）", num);
     notify_system("来电提醒", body);
 }
 

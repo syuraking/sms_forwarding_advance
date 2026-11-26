@@ -83,10 +83,12 @@ JSON 转义、URL 编码、Base64、HMAC-SHA256→Base64（钉钉/飞书签名�
 - 初始化流程：EN 断电重启 → `AT` 握手 → `ATI` 识别型号 → `AT+CGACT=0,1`（ML307Y 跳过）
   → `apply_sms_config()`（`AT+CNMI=2,2,0,0,0` + `AT+CMGF=0` + `AT+CLIP=1`）→ `AT+COPS`（按配置选网）
   → `AT+CEREG?` 等注册 → 注册后再跑一次 `modem_sms_config_check()`；
-- 来电显示：`apply_sms_config()` 里同时执行 `AT+CLIP=1`（失败只记日志，不影响短信），所以模组复位后
-  随 `+CNMI` 一起补发。来电时模组每次振铃都会上报 `+CLIP: "号码",...`，`handle_clip()` 解析号码并通过
-  `modem_set_call_handler()` 注册的回调通知上层；同一号码 20 秒内的重复振铃只回调一次，收到
-  `NO CARRIER` / `BUSY` 后重置，号码被隐藏时回调参数为空串；
+- 来电：`apply_sms_config()` 里同时执行 `AT+CLIP=1`（失败只记日志，不影响短信），所以模组复位后随 `+CNMI`
+  一起补发。来电期间模组会反复上报 `RING`、`+CLIP: "号码",...` 或（ML307 实测）
+  `+CLCC: <idx>,<dir>,<stat>,...,"号码"`（dir=1 且 stat=4/5 为来电），`call_touch()` 只记录「有来电 + 号码」并重新计时。
+  **挂断后才回调一次**（`modem_set_call_handler()` 注册的回调，参数为号码，号码被隐藏时为空串）：
+  明确的结束信号是 `NO CARRIER` / `BUSY` / `VOICE CALL: END` / `+CLCC` 状态不再是振铃；兜底是 12 秒内没有新的
+  振铃类上报（esp_timer 一次性定时器 `call_quiet`，每次振铃重置），因为不同模组的挂断提示不一致；
 - **`+CNMI` 会被模组清掉，必须兜底复核**：实测 ML307Y 在 `AT+CFUN=1` 之后约 8 秒（SIM 重新
   `+CPIN: READY`）把 `+CNMI` 恢复成默认的 `0,0,0,0,0`，此后一条 `+CMT` 都不上报，日志毫无动静。
   `modem_sms_config_check()` 用 `AT+CNMI?` 读回校验（要求 mode=2、mt=2），不对就重新下发；
@@ -154,7 +156,7 @@ EN 引脚（GPIO5，低电平断电）与板载 LED（GPIO8，低电平点亮）
 
 - 队列 + 工作任务的异步通知模型，调用方只投递；
 - `notify_sms()`：一条短信 → 邮件 + 所有有效推送通道（文案"📱短信通知"）；
-- `notify_call()`：来电提醒 → 邮件 + 所有有效推送通道（文案"🔔 来电提醒 / 来电号码: …"，内部走 `notify_system()`）；
+- `notify_call()`：来电提醒（挂断后）→ 邮件 + 所有有效推送通道（文案"🔔 来电提醒 / 来电号码: …（对方已挂断）"，内部走 `notify_system()`）；
 - `notify_system()`：系统事件 → 邮件 + 所有有效推送通道（文案"🔔 标题"）；
 - 邮件是否发送由 `config_mail_active()` 判定：邮件开关 `mail_enabled` 打开 **且** SMTP 四项齐全；
   关闭开关后短信照常转发到推送通道，只是不再发邮件；

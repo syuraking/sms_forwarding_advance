@@ -54,47 +54,132 @@ static volatile bool s_init_done;
 static char s_model[MODEM_MODEL_MAX];
 static char s_version[MODEM_VERSION_MAX];
 
-/* ---- URC：来电显示 ---- */
-#define CALL_DEDUP_MS 20000 /* 同一号码在此时间内的重复振铃视为同一通来电 */
+/* ---- URC：来电（挂断后推送） ----
+ * 来电期间模组会反复上报 RING / +CLIP / +CLCC。这里只记录这通来电和它的号码，
+ * 等通话结束再回调一次：
+ *  - 明确的结束信号：NO CARRIER / BUSY / VOICE CALL: END，或 +CLCC 状态不再是振铃；
+ *  - 兜底：CALL_QUIET_MS 内没有任何新的振铃上报，也视为对方已挂断（不同模组的挂断提示不一样）。 */
+#define CALL_QUIET_MS 12000 /* 超过这么久没有新的振铃上报，视为对方已挂断 */
+
 static modem_call_cb_t s_call_cb;
-static char s_last_call[32];
-static int64_t s_last_call_ms = -1;
+static SemaphoreHandle_t s_call_mu; /* 保护 s_call_active / s_call_number（AT 读取任务与定时器任务都会访问） */
+static esp_timer_handle_t s_call_timer;
+static bool s_call_active;
+static char s_call_number[32];
 
-void modem_set_call_handler(modem_call_cb_t cb)
+/** 结束当前来电并回调（没有进行中的来电则什么都不做）。 */
+static void call_finish(const char *why)
 {
-    s_call_cb = cb;
-}
-
-/** 解析 +CLIP: "<number>",<type>,... 里的号码（可能为空串）。 */
-static void handle_clip(const char *line)
-{
-    char number[sizeof(s_last_call)] = {0};
-    const char *q1 = strchr(line, '"');
-    if (q1) {
-        const char *q2 = strchr(q1 + 1, '"');
-        if (q2) {
-            size_t n = (size_t)(q2 - (q1 + 1));
-            if (n >= sizeof(number)) {
-                n = sizeof(number) - 1;
-            }
-            memcpy(number, q1 + 1, n);
-            number[n] = '\0';
-        }
+    if (!s_call_mu) {
+        return;
     }
-
-    /* 来电期间模组每次振铃（约 3~5 秒）都会重复上报 +CLIP，只在新来电时通知一次 */
-    int64_t now = esp_timer_get_time() / 1000;
-    bool same = s_last_call_ms >= 0 && (now - s_last_call_ms) < CALL_DEDUP_MS &&
-                strcmp(number, s_last_call) == 0;
-    s_last_call_ms = now;
-    snprintf(s_last_call, sizeof(s_last_call), "%s", number);
-    if (same) {
+    char number[sizeof(s_call_number)];
+    xSemaphoreTake(s_call_mu, portMAX_DELAY);
+    bool was_active = s_call_active;
+    s_call_active = false;
+    snprintf(number, sizeof(number), "%s", s_call_number);
+    s_call_number[0] = '\0';
+    xSemaphoreGive(s_call_mu);
+    if (!was_active) {
         return;
     }
 
-    log_line("收到来电: %s", number[0] ? number : "（号码未显示）");
+    (void)esp_timer_stop(s_call_timer); /* 在定时器回调里调用会返回 INVALID_STATE，忽略即可 */
+    log_line("来电结束（%s）: %s", why, number[0] ? number : "（号码未显示）");
     if (s_call_cb) {
         s_call_cb(number);
+    }
+}
+
+static void call_quiet_timer_cb(void *arg)
+{
+    (void)arg;
+    call_finish("响铃已停止");
+}
+
+/** 收到一次振铃类上报：标记来电进行中，记下号码（如果有），并重新计时。 */
+static void call_touch(const char *number)
+{
+    if (!s_call_mu || !s_call_timer) {
+        return;
+    }
+    xSemaphoreTake(s_call_mu, portMAX_DELAY);
+    bool is_new = !s_call_active;
+    s_call_active = true;
+    if (number && number[0]) {
+        snprintf(s_call_number, sizeof(s_call_number), "%s", number);
+    }
+    xSemaphoreGive(s_call_mu);
+    if (is_new) {
+        log_line("来电响铃中，挂断后推送号码");
+    }
+    (void)esp_timer_stop(s_call_timer);
+    (void)esp_timer_start_once(s_call_timer, (uint64_t)CALL_QUIET_MS * 1000ULL);
+}
+
+void modem_set_call_handler(modem_call_cb_t cb)
+{
+    if (!s_call_mu) {
+        s_call_mu = xSemaphoreCreateMutex();
+    }
+    if (!s_call_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = call_quiet_timer_cb,
+            .name = "call_quiet",
+        };
+        if (esp_timer_create(&args, &s_call_timer) != ESP_OK) {
+            s_call_timer = NULL;
+            log_line("创建来电计时器失败，来电提醒不可用");
+        }
+    }
+    s_call_cb = cb;
+}
+
+/** 取行内第一个双引号里的内容作为来电号码（+CLIP 与 +CLCC 都是这个格式，可能为空串）。 */
+static void extract_quoted(const char *line, char *out, size_t cap)
+{
+    out[0] = '\0';
+    const char *q1 = strchr(line, '"');
+    if (!q1) {
+        return;
+    }
+    const char *q2 = strchr(q1 + 1, '"');
+    if (!q2) {
+        return;
+    }
+    size_t n = (size_t)(q2 - (q1 + 1));
+    if (n >= cap) {
+        n = cap - 1;
+    }
+    memcpy(out, q1 + 1, n);
+    out[n] = '\0';
+}
+
+/** +CLIP: "<number>",<type>,...（AT+CLIP=1 后每次振铃上报） */
+static void handle_clip(const char *line)
+{
+    char number[sizeof(s_call_number)];
+    extract_quoted(line, number, sizeof(number));
+    call_touch(number);
+}
+
+/**
+ * +CLCC: <idx>,<dir>,<stat>,<mode>,<mpty>,"<number>",<type>,...
+ * 部分模组（实测 ML307）用它主动上报通话状态，不发 +CLIP。
+ * dir=1 为来电；stat=4 振铃、5 呼叫等待是来电进行中，其余状态（挂断等）视为通话结束。
+ */
+static void handle_clcc(const char *line)
+{
+    int idx = 0, dir = -1, stat = -1;
+    if (sscanf(line, "+CLCC: %d,%d,%d", &idx, &dir, &stat) != 3 || dir != 1) {
+        return;
+    }
+    if (stat == 4 || stat == 5) {
+        char number[sizeof(s_call_number)];
+        extract_quoted(line, number, sizeof(number));
+        call_touch(number);
+    } else {
+        call_finish("通话状态变化");
     }
 }
 
@@ -164,7 +249,13 @@ static void handle_urc(const char *line)
         return;
     }
     if (util_starts_with(line, "+CLIP:")) {
+        log_line("模组> %s", line);
         handle_clip(line);
+        return;
+    }
+    if (util_starts_with(line, "+CLCC:")) {
+        log_line("模组> %s", line);
+        handle_clcc(line);
         return;
     }
     /* SIM 重新 READY（CFUN 循环、模组自重启）时，模组会把 +CNMI 恢复成默认的
@@ -213,14 +304,18 @@ static void handle_urc(const char *line)
         return;
     }
 
-    /* 通话结束：下一通来电（哪怕同号码）重新通知 */
-    if (util_starts_with(line, "NO CARRIER") || util_starts_with(line, "BUSY")) {
-        s_last_call_ms = -1;
+    /* 来电：振铃（每次 RING 都重新计时）与挂断 */
+    if (util_starts_with(line, "RING")) {
+        call_touch(NULL);
+    } else if (util_starts_with(line, "NO CARRIER") || util_starts_with(line, "BUSY") ||
+               util_starts_with(line, "VOICE CALL: END")) {
+        call_finish("挂断");
     }
 
     /* 只记录真正的主动上报，避免 AT 应答行被当成 URC 刷屏 */
     if (line[0] == '+' || util_starts_with(line, "RDY") || util_starts_with(line, "RING") ||
-        util_starts_with(line, "NO CARRIER")) {
+        util_starts_with(line, "NO CARRIER") || util_starts_with(line, "BUSY") ||
+        util_starts_with(line, "VOICE CALL")) {
         log_line("模组> %s", line);
     }
 }
