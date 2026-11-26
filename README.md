@@ -86,7 +86,7 @@
 
 - ESP32-C3 开发板：[SuperMini](https://item.taobao.com/item.htm?id=852057780489)，¥9.5 包邮
 - 4G 模组：[小蓝鲸 ML307R-DC 核心板](https://item.taobao.com/item.htm?id=797466121802)，¥16.3 包邮 (同类型的支持数据和短信的，还有ML307C-DC-CN)，需要注意的是，DC这类模块没有IMS注册功能，电信和广电无法正常使用。
-- 4G 模组：[誉真ML307A-DLSN核心板[](https://detail.tmall.com/item.htm?id=1067894687755)，¥21.6 包邮 ，支持电信和广电，正常注册IMS和VOLTE。
+- 4G 模组：[誉真ML307A-DLSN核心板](https://detail.tmall.com/item.htm?id=1067894687755)，¥21.6 包邮 ，支持电信和广电，正常注册IMS和VOLTE。
 
 - [4G FPC 天线](https://item.taobao.com/item.htm?id=797466121802)，¥2，与核心板同购
 - Nano SIM 卡一张（支持 eUICC 的 eSIM 卡也可以，见下一节）+ 5 根杜邦线
