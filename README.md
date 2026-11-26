@@ -6,6 +6,14 @@
 
 # 低成本短信转发器
 
+感谢 https://github.com/chenxuuu/sms_forwarding 作者的基础，才有了本项目的可能。
+因为原作者不打算支持来电号码推送提醒功能，也不支持 wxpusher 通道的简易配置，所以这边做了下修改。
+后期会不定期同步原作者的最新源码，并添加上述两个功能。
+
+其它更新内容基本保持原作者的不变，请大家多多关注原出处。
+
+----------------
+
 **一张 4G 卡（实体 SIM 或 eSIM）+ 一块 ESP32-C3，把收到的短信在几秒内推到邮件、钉钉、飞书、微信、Telegram**
 
 [![License](https://img.shields.io/github/license/chenxuuu/sms_forwarding?style=flat-square&color=4f7cff)](LICENSE)
@@ -33,10 +41,10 @@
 ## 它解决什么问题
 
 给设备插一张手机卡（Nano SIM，或支持 eUICC 的 eSIM 卡），开机后连上 WiFi 并盯着 4G 模组。
-任何人给这张卡发短信，设备会解析内容、合并长短信、过滤黑名单，然后**同时**转发到你配置的渠道。
+任何人给这张卡发短信或者来电话（模块需要支持VOLTE），设备会解析内容、合并长短信、过滤黑名单，然后**同时**转发到你配置的渠道。
 
 - **不需要服务器、不需要公网 IP**：设备直连邮件服务器和推送平台，短信内容不经过任何中转
-- **硬件约 28 元**，插一根 USB 线就能 7×24 挂着，长期挂着建议配个 5V 电源
+- **硬件约 40 元**，插一根 USB 线就能 7×24 挂着，长期挂着建议配个 5V 电源
 - **专为"养卡"设计**：低流量保号操作 + 定时任务，让卡保持活跃又不烧钱
 - **eSIM 也能管**：网页里读 EID 和配置列表、一键切卡 / 删卡；扫运营商的二维码或粘贴激活码，直接生成写卡命令（写卡在电脑上跑，不占设备资源）
 
@@ -75,11 +83,14 @@
 **自己接**：总成本约 ¥27.8（价格会浮动；DIY 方案目前实测支持移动 / 联通卡）
 
 - ESP32-C3 开发板：[SuperMini](https://item.taobao.com/item.htm?id=852057780489&skuId=5813710390565)，¥9.5 包邮
-- 4G 模组：[小蓝鲸 ML307R-DC 核心板](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥16.3 包邮
+- 4G 模组：[小蓝鲸 ML307R-DC 核心板](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥16.3 包邮 (同类型的支持数据和短信的，还有ML307C-DC-CN)，需要注意的是，DC这类模块没有IMS注册功能，电信和广电无法正常使用。
+- 4G 模组：[誉真ML307A-DLSN核心板[](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)](https://detail.tmall.com/item.htm?abbucket=20&id=1067894687755)，¥21.6 包邮 ，支持电信和广电，正常注册IMS和VOLTE。
+
 - [4G FPC 天线](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥2，与核心板同购
 - Nano SIM 卡一张（支持 eUICC 的 eSIM 卡也可以，见下一节）+ 5 根杜邦线
 
 <p align="center"><img src="assets/wiring.svg" width="780" alt="接线：GPIO5→EN、GPIO3→RX、GPIO4→TX、GND 共地、5V→VCC"></p>
+誉真的核心板，无需要连接EN这根。
 
 > 模组跑的是出厂 AT 固件，**不用刷机、不用改**，只当"能收短信的串口猫"用。
 
@@ -157,10 +168,11 @@ sms_forwarding/
 │   ├── components/         # core / modem / net / notify / forwarder / sched / ota / esim / web
 │   ├── docs/               # 架构、模块、接口、编译烧录文档
 │   └── tools/              # 串口抓日志脚本
-├── code/                   # 历史实现：Arduino 框架
+├── code/                   # 历史实现：Arduino 框架，原作者的部分
 │   ├── dev_doc/            # Arduino 版的架构与接口文档
 │   └── README.md
 ├── assets/                 # 图片、原理图、纯前端演示页
+├── code-wx/                   # 基于作者历史代码整合的带有wxpusher通道的修改版本，无来电号码通知功能
 ├── tools/
 │   └── esim_bridge.py      # 把 lpac 的 APDU 转发到设备（电脑上跑）
 ├── README.md               # 中文（默认）
